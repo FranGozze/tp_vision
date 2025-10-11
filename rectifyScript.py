@@ -1,16 +1,46 @@
 import cv2 as cv
 import numpy as np
+from matplotlib import pyplot as plt
 import yaml
 import os
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
-
+from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
+from rclpy.executors import MultiThreadedExecutor
+from datetime import datetime as time
 def load_calibration_data(file_path):
     with open(file_path, 'r') as file:
         calib_data = yaml.safe_load(file)
     return calib_data
+
+class BagPlayer(Node):
+    def __init__(self):
+        super().__init__('bag_player')
+        self.bridge = CvBridge()
+        self.timer = self.create_timer(0.1, self.timer_callback)  # Publicar cada 0.1 segundos
+        self.reader = SequentialReader()
+        try:
+            self.reader.open(StorageOptions(uri='V1_01_easy'), ConverterOptions( input_serialization_format='cdr', output_serialization_format='cdr'))
+        except Exception as e:
+            self.get_logger().error(f'Failed to open bag file: {e}')
+            # rclpy.shutdown()
+            return
+        self.remap_topics = {
+            '/cam0/image_raw': self.create_publisher(Image, '/stereo/left/image_raw', 10),
+            '/cam1/image_raw': self.create_publisher(Image, '/stereo/right/image_raw', 10),
+        }
+        self.timer = self.create_timer(0.1, self.timer_callback)
+  
+    def timer_callback(self):
+        while self.reader.has_next():
+            (topic, raw_data, _) = self.reader.read_next()
+            if topic in self.remap_topics.keys():
+                self.remap_topics[topic].publish(raw_data)
+                break  # Publicar solo un mensaje por llamada al timer
+            else:
+                continue
 
 class ImageRectifier(Node):
     def __init__(self):
@@ -48,6 +78,9 @@ class ImageRectifier(Node):
             self.image_size, cv.CV_32FC1
         )
         
+        # Publishers
+        self.pub_left_rect = self.create_publisher(Image, '/stereo/left/image_rect', 10)
+        self.pub_right_rect = self.create_publisher(Image, '/stereo/right/image_rect', 10)
         # Subscribers
         self.sub_left = self.create_subscription(
             Image,
@@ -63,9 +96,6 @@ class ImageRectifier(Node):
             10
         )
         
-        # Publishers
-        self.pub_left_rect = self.create_publisher(Image, '/stereo/left/image_rect', 10)
-        self.pub_right_rect = self.create_publisher(Image, '/stereo/right/image_rect', 10)
 
     def left_image_callback(self, msg):
         cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -81,15 +111,73 @@ class ImageRectifier(Node):
         rect_msg.header = msg.header
         self.pub_right_rect.publish(rect_msg)
 
+
+class KeypointDetector(Node):
+    def __init__(self):
+        super().__init__('keypoint_detector')
+        self.bridge = CvBridge()
+        self.orb = cv.ORB_create()
+        self.subscription_left = self.create_subscription(
+            Image,
+            '/stereo/left/image_rect',
+            self.left_callback, 10)
+        self.subscription_right = self.create_subscription(
+            Image,
+            '/stereo/right/image_rect',
+            self.right_callback, 10)
+        self.remap_topics = {
+            'left': self.create_publisher(Image, '/stereo/left/image_keypoints', 10),
+            'right': self.create_publisher(Image, '/stereo/right/image_keypoints', 10),
+        }
+        self.printed = {"left": False, "right": False}
+
+    def left_callback(self, msg):
+        self.listener_callback(msg, "left")
+
+    def right_callback(self, msg):
+        self.listener_callback(msg, "right")
+
+    def listener_callback(self, msg, name):
+        if not self.printed[name]:
+            print("Processing:", name)
+            self.printed[name] = True
+        img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+
+        # Obtener los keypoints de la imagen
+        keypoints, descriptors = self.orb.detectAndCompute(img,None)
+
+        # Dibujar los puntos en la imagen
+        output_image = cv.drawKeypoints(img, keypoints,None,color=(0,255,0))
+        # output_image = cv.drawKeypoints(img, keypoints, img, flags=cv.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+        key_msg = self.bridge.cv2_to_imgmsg(output_image, encoding='bgr8')
+        key_msg.header = msg.header
+        self.remap_topics[name].publish(key_msg)
+            
+        cv.waitKey(1)
+
+
 def main(args=None):
     rclpy.init(args=args)
-    
+    print("Starting bag player")
+    bag_player = BagPlayer()
+    executor = MultiThreadedExecutor()
+    executor.add_node(bag_player)
+    print("Starting image rectifier")
     rectifier = ImageRectifier()
-    
-    rclpy.spin(rectifier)
-    
-    rectifier.destroy_node()
-    rclpy.shutdown()
+    executor.add_node(rectifier)
+    print("Starting keypoint detector")
+    keyDetector = KeypointDetector()
+    executor.add_node(keyDetector)
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        executor.shutdown()
+        bag_player.destroy_node()
+        rectifier.destroy_node()
+        keyDetector.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
