@@ -5,7 +5,8 @@ import yaml
 import os
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image
+from std_msgs.msg import UInt8MultiArray, MultiArrayDimension
 from cv_bridge import CvBridge
 from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
 from rclpy.executors import MultiThreadedExecutor
@@ -112,48 +113,89 @@ class ImageRectifier(Node):
         self.pub_right_rect.publish(rect_msg)
 
 
-class KeypointDetector(Node):
+class Matcher(Node):
     def __init__(self):
+        super().__init__('matcher')
+        self.bridge = CvBridge()
+        self.bf = cv.BFMatcher(cv.NORM_HAMMING, crossCheck=True)
+        self.publisher = self.create_publisher(Image, '/stereo/matched_keypoints', 10)
+        self.left_info = []
+        self.right_info = []
+
+    def set_info(self, info, side):
+        if side == "right":
+            self.right_info.append(info)
+        elif side == "left":
+            self.left_info.append(info)
+        self.match_keypoints()
+
+    
+
+    def match_keypoints(self):
+        # print("side: ", "left" if self.left_info is not None else "right")
+        if len(self.left_info) > 0 and len(self.left_info) == len(self.right_info):
+            print("Matching keypoints between left and right images")
+            left = self.left_info[0]
+            right = self.right_info[0]
+            matches = self.bf.match(left['descriptors'], right['descriptors'])
+            matches = sorted(matches, key=lambda x: x.distance)
+            matched_image = cv.drawMatches(
+                left['image'], left['keypoints'],
+                right['image'], right['keypoints'],
+                matches[:10], None, flags=cv.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+            )
+            match_msg = self.bridge.cv2_to_imgmsg(matched_image, encoding='bgr8')
+            match_msg.header = left['header']
+            match_msg.header.frame_id = "matched_keypoints"
+            # self.publisher.publish(match_msg)
+            # Reset images after processing
+            self.left_info.pop(0)
+            self.right_info.pop(0)
+            # cv.imshow("Matched Keypoints", matched_image)
+            # cv.waitKey(1)
+            
+
+
+
+class KeypointDetector(Node):
+    def __init__(self, side, matcher):
         super().__init__('keypoint_detector')
         self.bridge = CvBridge()
         self.orb = cv.ORB_create()
         self.subscription_left = self.create_subscription(
             Image,
-            '/stereo/left/image_rect',
-            self.left_callback, 10)
-        self.subscription_right = self.create_subscription(
-            Image,
-            '/stereo/right/image_rect',
-            self.right_callback, 10)
-        self.remap_topics = {
-            'left': self.create_publisher(Image, '/stereo/left/image_keypoints', 10),
-            'right': self.create_publisher(Image, '/stereo/right/image_keypoints', 10),
-        }
-        self.printed = {"left": False, "right": False}
+            f'/stereo/{side}/image_rect',
+            self.listener_callback, 10)
+        self.publisher = self.create_publisher(Image, f'/stereo/{side}/image_keypoints', 10)
+        self.side = side
+        self.matcher = matcher
 
-    def left_callback(self, msg):
-        self.listener_callback(msg, "left")
 
-    def right_callback(self, msg):
-        self.listener_callback(msg, "right")
 
-    def listener_callback(self, msg, name):
-        if not self.printed[name]:
-            print("Processing:", name)
-            self.printed[name] = True
+    def listener_callback(self, msg):
         img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
 
         # Obtener los keypoints de la imagen
         keypoints, descriptors = self.orb.detectAndCompute(img,None)
+
+        # Enviar la información al matcher
+        info = {
+            'keypoints': keypoints,
+            'descriptors': descriptors,
+            'image': img,
+            'header': msg.header
+            # 'stamp': msg.header.stamp
+        }
+        self.matcher.set_info(info, self.side)
 
         # Dibujar los puntos en la imagen
         output_image = cv.drawKeypoints(img, keypoints,None,color=(0,255,0))
         # output_image = cv.drawKeypoints(img, keypoints, img, flags=cv.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
         key_msg = self.bridge.cv2_to_imgmsg(output_image, encoding='bgr8')
         key_msg.header = msg.header
-        self.remap_topics[name].publish(key_msg)
+        self.publisher.publish(key_msg)
             
-        cv.waitKey(1)
+        # cv.waitKey(1)
 
 
 def main(args=None):
@@ -162,12 +204,17 @@ def main(args=None):
     bag_player = BagPlayer()
     executor = MultiThreadedExecutor()
     executor.add_node(bag_player)
-    print("Starting image rectifier")
-    rectifier = ImageRectifier()
-    executor.add_node(rectifier)
-    print("Starting keypoint detector")
-    keyDetector = KeypointDetector()
-    executor.add_node(keyDetector)
+    # print("Starting image rectifier")
+    # rectifier = ImageRectifier()
+    # executor.add_node(rectifier)
+    # print("Starting matcher")
+    # matcher = Matcher()
+    # executor.add_node(matcher)
+    # print("Starting keypoint detector")
+    # keyDetectorL = KeypointDetector("left", matcher)    
+    # keyDetectorR = KeypointDetector("right", matcher)
+    # executor.add_node(keyDetectorL)
+    # executor.add_node(keyDetectorR)
     try:
         executor.spin()
     except KeyboardInterrupt:
@@ -175,8 +222,10 @@ def main(args=None):
     finally:
         executor.shutdown()
         bag_player.destroy_node()
-        rectifier.destroy_node()
-        keyDetector.destroy_node()
+        # rectifier.destroy_node()
+        # keyDetectorL.destroy_node()
+        # keyDetectorR.destroy_node()
+        # matcher.destroy_node()
         rclpy.shutdown()
 
 if __name__ == '__main__':
