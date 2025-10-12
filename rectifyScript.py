@@ -36,8 +36,8 @@ class BagPlayer(Node):
   
     def timer_callback(self):
         while self.reader.has_next():
-            (topic, raw_data, _) = self.reader.read_next()
-            if topic in self.remap_topics.keys():
+            (topic, raw_data, stamp) = self.reader.read_next()
+            if topic in self.remap_topics.keys():    
                 self.remap_topics[topic].publish(raw_data)
                 break  # Publicar solo un mensaje por llamada al timer
             else:
@@ -119,24 +119,24 @@ class Matcher(Node):
         self.bridge = CvBridge()
         self.bf = cv.BFMatcher(cv.NORM_HAMMING, crossCheck=True)
         self.publisher = self.create_publisher(Image, '/stereo/matched_keypoints', 10)
-        self.left_info = []
-        self.right_info = []
+        self.info = {}
+        
 
     def set_info(self, info, side):
-        if side == "right":
-            self.right_info.append(info)
-        elif side == "left":
-            self.left_info.append(info)
-        self.match_keypoints()
+        stamp = info['header'].stamp
+        stamp_obj = (stamp.sec, stamp.nanosec)
+        stamps.add(stamp_obj)
+        if stamp_obj not in self.info:
+            self.info[stamp_obj] = {}
+        self.info[stamp_obj][side] = info
+        self.match_keypoints(stamp_obj)
 
-    
-
-    def match_keypoints(self):
+    def match_keypoints(self, stamp):
         # print("side: ", "left" if self.left_info is not None else "right")
-        if len(self.left_info) > 0 and len(self.left_info) == len(self.right_info):
+        if stamp in self.info and "left" in self.info[stamp] and "right" in self.info[stamp]:
             print("Matching keypoints between left and right images")
-            left = self.left_info[0]
-            right = self.right_info[0]
+            left = self.info[stamp]["left"]
+            right = self.info[stamp]["right"]
             matches = self.bf.match(left['descriptors'], right['descriptors'])
             matches = sorted(matches, key=lambda x: x.distance)
             matched_image = cv.drawMatches(
@@ -147,10 +147,8 @@ class Matcher(Node):
             match_msg = self.bridge.cv2_to_imgmsg(matched_image, encoding='bgr8')
             match_msg.header = left['header']
             match_msg.header.frame_id = "matched_keypoints"
-            # self.publisher.publish(match_msg)
+            self.publisher.publish(match_msg)
             # Reset images after processing
-            self.left_info.pop(0)
-            self.right_info.pop(0)
             # cv.imshow("Matched Keypoints", matched_image)
             # cv.waitKey(1)
             
@@ -204,17 +202,17 @@ def main(args=None):
     bag_player = BagPlayer()
     executor = MultiThreadedExecutor()
     executor.add_node(bag_player)
-    # print("Starting image rectifier")
-    # rectifier = ImageRectifier()
-    # executor.add_node(rectifier)
-    # print("Starting matcher")
-    # matcher = Matcher()
-    # executor.add_node(matcher)
-    # print("Starting keypoint detector")
-    # keyDetectorL = KeypointDetector("left", matcher)    
-    # keyDetectorR = KeypointDetector("right", matcher)
-    # executor.add_node(keyDetectorL)
-    # executor.add_node(keyDetectorR)
+    print("Starting image rectifier")
+    rectifier = ImageRectifier()
+    executor.add_node(rectifier)
+    print("Starting matcher")
+    matcher = Matcher()
+    executor.add_node(matcher)
+    print("Starting keypoint detector")
+    keyDetectorL = KeypointDetector("left", matcher)    
+    keyDetectorR = KeypointDetector("right", matcher)
+    executor.add_node(keyDetectorL)
+    executor.add_node(keyDetectorR)
     try:
         executor.spin()
     except KeyboardInterrupt:
