@@ -5,12 +5,12 @@ import yaml
 import os
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
-from std_msgs.msg import UInt8MultiArray, MultiArrayDimension
+from sensor_msgs.msg import Image, PointCloud2, PointField
 from cv_bridge import CvBridge
 from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
 from rclpy.executors import MultiThreadedExecutor
 from datetime import datetime as time
+import struct
 def load_calibration_data(file_path):
     with open(file_path, 'r') as file:
         calib_data = yaml.safe_load(file)
@@ -114,18 +114,18 @@ class ImageRectifier(Node):
 
 
 class Matcher(Node):
-    def __init__(self):
+    def __init__(self, triangulation):
         super().__init__('matcher')
         self.bridge = CvBridge()
         self.bf = cv.BFMatcher(cv.NORM_HAMMING, crossCheck=True)
         self.publisher = self.create_publisher(Image, '/stereo/matched_keypoints', 10)
         self.info = {}
+        self.triangulation = triangulation
         
-
+        
     def set_info(self, info, side):
         stamp = info['header'].stamp
         stamp_obj = (stamp.sec, stamp.nanosec)
-        stamps.add(stamp_obj)
         if stamp_obj not in self.info:
             self.info[stamp_obj] = {}
         self.info[stamp_obj][side] = info
@@ -139,6 +139,7 @@ class Matcher(Node):
             right = self.info[stamp]["right"]
             matches = self.bf.match(left['descriptors'], right['descriptors'])
             matches = sorted(matches, key=lambda x: x.distance)
+            self.triangulation.compute(matches, left, right)
             matched_image = cv.drawMatches(
                 left['image'], left['keypoints'],
                 right['image'], right['keypoints'],
@@ -153,8 +154,6 @@ class Matcher(Node):
             # cv.waitKey(1)
             
 
-
-
 class KeypointDetector(Node):
     def __init__(self, side, matcher):
         super().__init__('keypoint_detector')
@@ -167,8 +166,6 @@ class KeypointDetector(Node):
         self.publisher = self.create_publisher(Image, f'/stereo/{side}/image_keypoints', 10)
         self.side = side
         self.matcher = matcher
-
-
 
     def listener_callback(self, msg):
         img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -195,6 +192,73 @@ class KeypointDetector(Node):
             
         # cv.waitKey(1)
 
+    
+    
+class TriangulatePoints(Node):
+    def __init__(self):
+        super().__init__('triangulate_points')
+        self.bridge = CvBridge()
+        self.publisher = self.create_publisher(PointCloud2, '/stereo/triangulated_points', 10)
+        calib_data_left = load_calibration_data(f'calibrationdata/left.yaml')
+        calib_data_right = load_calibration_data(f'calibrationdata/right.yaml')
+        projection_left = np.array(calib_data_left['projection_matrix']['data']).reshape(3, 4)
+        projection_right = np.array(calib_data_right['projection_matrix']['data']).reshape(3, 4)
+        self.projections = np.array([projection_left, projection_right])
+    
+    def publish(self, points, header):
+        field = [PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1)]
+        buffer = b''.join([struct.pack('fff',*p) for p in points])
+
+        msg = PointCloud2()
+        msg.width = points.shape[0]
+        msg.height = 1
+        msg.point_step = 12
+        msg.row_step = 12 * points.shape[0]
+        msg.header = header
+        msg.header.frame_id = "map"
+        msg.data = buffer
+        msg.fields = field
+        msg.is_bigendian = False
+        msg.is_dense = False
+        self.publisher.publish(msg)
+    
+    def compute(self, matches, left_info, right_info):
+        pts_left = np.float32([left_info['keypoints'][m.queryIdx].pt for m in matches])
+        pts_right = np.float32([right_info['keypoints'][m.trainIdx].pt for m in matches])
+        triangulatedPoints = cv.triangulatePoints(self.projections[0], self.projections[1], pts_left.T, pts_right.T)
+        triangulatedPoints = (triangulatedPoints[:3] / triangulatedPoints[3]).T
+        
+        self.publish(triangulatedPoints, left_info['header'])
+        
+        # Publicar los puntos 3D como PointCloud2
+
+class TriangulatedPointsRansac(TriangulatePoints):
+    def __init__(self):
+        super().__init__()
+        self.publisherImg = self.create_publisher(Image, '/stereo/transformed_image', 10)
+    
+    def compute(self, matches, left_info, right_info):
+        pts_left = np.float32([left_info['keypoints'][m.queryIdx].pt for m in matches])
+        pts_right = np.float32([right_info['keypoints'][m.trainIdx].pt for m in matches])
+        # Aplicar RANSAC para eliminar outliers
+        H, mask = cv.findHomography(pts_left, pts_right, cv.RANSAC, 5.0)
+        pts_left = pts_left[mask.ravel().astype(bool)]
+        pts_right = pts_right[mask.ravel().astype(bool)]
+        triangulatedPoints = cv.triangulatePoints(self.projections[0], self.projections[1], pts_left.T, pts_right.T)
+        triangulatedPoints = (triangulatedPoints[:3] / triangulatedPoints[3]).T
+
+        pts_left_transformed = cv.perspectiveTransform(pts_left.reshape(-1,1,2), H)
+
+        img_vis = right_info['image'].copy()
+        for p in pts_left_transformed:
+            cv.circle(img_vis, tuple(np.int32(p[0])), 3, (0,255,0), -1)
+        msg = self.bridge.cv2_to_imgmsg(img_vis, encoding='bgr8')
+        msg.header = left_info['header']
+        self.publisherImg.publish(msg)
+
+        self.publish(triangulatedPoints, left_info['header'])
+        
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -205,8 +269,12 @@ def main(args=None):
     print("Starting image rectifier")
     rectifier = ImageRectifier()
     executor.add_node(rectifier)
+    print("starting Triangulation")
+    # triangulation = TriangulatePoints()
+    triangulation = TriangulatedPointsRansac()
+    executor.add_node(triangulation)
     print("Starting matcher")
-    matcher = Matcher()
+    matcher = Matcher(triangulation)
     executor.add_node(matcher)
     print("Starting keypoint detector")
     keyDetectorL = KeypointDetector("left", matcher)    
@@ -220,10 +288,11 @@ def main(args=None):
     finally:
         executor.shutdown()
         bag_player.destroy_node()
-        # rectifier.destroy_node()
-        # keyDetectorL.destroy_node()
-        # keyDetectorR.destroy_node()
-        # matcher.destroy_node()
+        rectifier.destroy_node()
+        keyDetectorL.destroy_node()
+        keyDetectorR.destroy_node()
+        matcher.destroy_node()
+        triangulation.destroy_node()
         rclpy.shutdown()
 
 if __name__ == '__main__':
