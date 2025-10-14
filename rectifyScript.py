@@ -46,9 +46,7 @@ class BagPlayer(Node):
 class ImageRectifier(Node):
     def __init__(self):
         super().__init__('image_rectifier')
-        
         self.bridge = CvBridge()
-        
         # Load calibration data
         calib_data_left = load_calibration_data(f'calibrationdata/left.yaml')
         calib_data_right = load_calibration_data(f'calibrationdata/right.yaml')
@@ -258,8 +256,57 @@ class TriangulatedPointsRansac(TriangulatePoints):
 
         self.publish(triangulatedPoints, left_info['header'])
         
+class DisparityMap(Node):
+    def __init__(self):
+        super().__init__('disparity_map')
+        self.bridge = CvBridge()
+        self.publisher = self.create_publisher(Image, '/stereo/disparity', 10)
+        self.info = {}
+        self.stereo = cv.StereoSGBM_create(minDisparity=0,
+                               numDisparities=16 * 5,  # Must be divisible by 16
+                               blockSize=11,
+                               P1=8 * 3 * 11**2,
+                               P2=32 * 3 * 11**2,
+                               disp12MaxDiff=1,
+                               uniquenessRatio=10,
+                               speckleWindowSize=100,
+                               speckleRange=32,
+                               preFilterCap=63,
+                               mode=cv.STEREO_SGBM_MODE_SGBM_3WAY)
+        self.subscription_left = self.create_subscription(
+            Image,
+            f'/stereo/left/image_rect',
+            self.left_callback, 10)
+        self.subscription_right = self.create_subscription(
+            Image,
+            f'/stereo/right/image_rect',
+            self.right_callback, 10)
+    def right_callback(self,msg):
+        self.set_info(msg, "right")
+    def left_callback(self,msg):
+        self.set_info(msg, "left")
+        
+    
+    
+    def set_info(self, msg, side):
+        img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        stamp = msg.header.stamp
+        stamp_obj = (stamp.sec, stamp.nanosec)
+        if stamp_obj not in self.info:
+            self.info[stamp_obj] = {}
+        self.info[stamp_obj][side] = img
+        self.compute(stamp_obj, msg.header)
 
-
+    def compute(self, stamp, header):
+        if stamp in self.info and "left" in self.info[stamp] and "right" in self.info[stamp]:
+            left_img = self.info[stamp]["left"]
+            right_img = self.info[stamp]["right"]
+            disparity_map = self.stereo.compute(left_img, right_img)
+            # disp_normalized = cv.normalize(disparity_map,None,255,0,cv.NORM_MINMAX, cv.CV_8U)
+            disp_msg = self.bridge.cv2_to_imgmsg(disparity_map)
+            disp_msg.header = header
+            self.publisher.publish(disp_msg)
+  
 def main(args=None):
     rclpy.init(args=args)
     print("Starting bag player")
@@ -269,6 +316,9 @@ def main(args=None):
     print("Starting image rectifier")
     rectifier = ImageRectifier()
     executor.add_node(rectifier)
+    print("Starting image disparity")
+    dispMap = DisparityMap()
+    executor.add_node(dispMap)
     print("starting Triangulation")
     # triangulation = TriangulatePoints()
     triangulation = TriangulatedPointsRansac()
@@ -289,6 +339,7 @@ def main(args=None):
         executor.shutdown()
         bag_player.destroy_node()
         rectifier.destroy_node()
+        dispMap.destroy_node()
         keyDetectorL.destroy_node()
         keyDetectorR.destroy_node()
         matcher.destroy_node()
