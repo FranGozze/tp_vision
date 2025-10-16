@@ -262,17 +262,19 @@ class DisparityMap(Node):
         self.bridge = CvBridge()
         self.publisher = self.create_publisher(Image, '/stereo/disparity', 10)
         self.info = {}
-        self.stereo = cv.StereoSGBM_create(minDisparity=0,
-                               numDisparities=16 * 5,  # Must be divisible by 16
-                               blockSize=11,
-                               P1=8 * 3 * 11**2,
-                               P2=32 * 3 * 11**2,
-                               disp12MaxDiff=1,
-                               uniquenessRatio=10,
-                               speckleWindowSize=100,
-                               speckleRange=32,
-                               preFilterCap=63,
-                               mode=cv.STEREO_SGBM_MODE_SGBM_3WAY)
+        self.stereo = cv.StereoSGBM_create(
+            minDisparity=0,
+            numDisparities=16 * 5,
+            blockSize=11,
+            P1=8 * 1 * 11**2,   # 1 instead of 3 for grayscale
+            P2=32 * 1 * 11**2,  # 1 instead of 3 for grayscale
+            disp12MaxDiff=1,
+            uniquenessRatio=10,
+            speckleWindowSize=100,
+            speckleRange=32,
+            preFilterCap=63,
+            mode=cv.STEREO_SGBM_MODE_SGBM_3WAY
+        )
         self.subscription_left = self.create_subscription(
             Image,
             f'/stereo/left/image_rect',
