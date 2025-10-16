@@ -2,7 +2,7 @@ import cv2 as cv
 import numpy as np
 from matplotlib import pyplot as plt
 import yaml
-import os
+import sys
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, PointCloud2, PointField
@@ -11,10 +11,12 @@ from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
 from rclpy.executors import MultiThreadedExecutor
 from datetime import datetime as time
 import struct
+
 def load_calibration_data(file_path):
     with open(file_path, 'r') as file:
         calib_data = yaml.safe_load(file)
     return calib_data
+
 
 class BagPlayer(Node):
     def __init__(self):
@@ -43,8 +45,9 @@ class BagPlayer(Node):
             else:
                 continue
 
+
 class ImageRectifier(Node):
-    def __init__(self):
+    def __init__(self, map3d):
         super().__init__('image_rectifier')
         self.bridge = CvBridge()
         # Load calibration data
@@ -66,7 +69,7 @@ class ImageRectifier(Node):
             self.K1, self.D1, self.K2, self.D2, 
             self.image_size, self.R, self.T, flags=cv.CALIB_ZERO_DISPARITY, alpha=0
         )
-        
+        map3d.setQ(self.Q)
         # Precompute the undistortion and rectification maps
         self.map1x, self.map1y = cv.initUndistortRectifyMap(
             self.K1, self.D1, self.R1, self.P1, 
@@ -130,9 +133,7 @@ class Matcher(Node):
         self.match_keypoints(stamp_obj)
 
     def match_keypoints(self, stamp):
-        # print("side: ", "left" if self.left_info is not None else "right")
         if stamp in self.info and "left" in self.info[stamp] and "right" in self.info[stamp]:
-            print("Matching keypoints between left and right images")
             left = self.info[stamp]["left"]
             right = self.info[stamp]["right"]
             matches = self.bf.match(left['descriptors'], right['descriptors'])
@@ -190,8 +191,25 @@ class KeypointDetector(Node):
             
         # cv.waitKey(1)
 
-    
-    
+
+def create_pointcloud2(points, header):
+    field = [PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1)]
+    buffer = b''.join([struct.pack('fff',*p) for p in points])
+
+    msg = PointCloud2()
+    msg.width = points.shape[0]
+    msg.height = 1
+    msg.point_step = 12
+    msg.row_step = 12 * points.shape[0]
+    msg.header = header
+    msg.header.frame_id = "map"
+    msg.data = buffer
+    msg.fields = field
+    msg.is_bigendian = False
+    msg.is_dense = False
+    return msg
+
+
 class TriangulatePoints(Node):
     def __init__(self):
         super().__init__('triangulate_points')
@@ -204,20 +222,7 @@ class TriangulatePoints(Node):
         self.projections = np.array([projection_left, projection_right])
     
     def publish(self, points, header):
-        field = [PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1)]
-        buffer = b''.join([struct.pack('fff',*p) for p in points])
-
-        msg = PointCloud2()
-        msg.width = points.shape[0]
-        msg.height = 1
-        msg.point_step = 12
-        msg.row_step = 12 * points.shape[0]
-        msg.header = header
-        msg.header.frame_id = "map"
-        msg.data = buffer
-        msg.fields = field
-        msg.is_bigendian = False
-        msg.is_dense = False
+        msg = create_pointcloud2(points, header)
         self.publisher.publish(msg)
     
     def compute(self, matches, left_info, right_info):
@@ -225,10 +230,10 @@ class TriangulatePoints(Node):
         pts_right = np.float32([right_info['keypoints'][m.trainIdx].pt for m in matches])
         triangulatedPoints = cv.triangulatePoints(self.projections[0], self.projections[1], pts_left.T, pts_right.T)
         triangulatedPoints = (triangulatedPoints[:3] / triangulatedPoints[3]).T
-        
         self.publish(triangulatedPoints, left_info['header'])
         
         # Publicar los puntos 3D como PointCloud2
+
 
 class TriangulatedPointsRansac(TriangulatePoints):
     def __init__(self):
@@ -255,13 +260,15 @@ class TriangulatedPointsRansac(TriangulatePoints):
         self.publisherImg.publish(msg)
 
         self.publish(triangulatedPoints, left_info['header'])
-        
+
+
 class DisparityMap(Node):
-    def __init__(self):
+    def __init__(self, map_3d):
         super().__init__('disparity_map')
         self.bridge = CvBridge()
         self.publisher = self.create_publisher(Image, '/stereo/disparity', 10)
         self.info = {}
+        self.map_3d = map_3d
         self.stereo = cv.StereoSGBM_create(
             minDisparity=0,
             numDisparities=16 * 5,
@@ -288,8 +295,6 @@ class DisparityMap(Node):
     def left_callback(self,msg):
         self.set_info(msg, "left")
         
-    
-    
     def set_info(self, msg, side):
         img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         stamp = msg.header.stamp
@@ -299,31 +304,73 @@ class DisparityMap(Node):
         self.info[stamp_obj][side] = img
         self.compute(stamp_obj, msg.header)
 
+    def publish(self, disp, header):
+        self.map_3d.set_info(disp, header)
+        disp_msg = self.bridge.cv2_to_imgmsg(disp)
+        disp_msg.header = header
+        self.publisher.publish(disp_msg)
+
     def compute(self, stamp, header):
         if stamp in self.info and "left" in self.info[stamp] and "right" in self.info[stamp]:
             left_img = self.info[stamp]["left"]
             right_img = self.info[stamp]["right"]
             disparity_map = self.stereo.compute(left_img, right_img)
             # disp_normalized = cv.normalize(disparity_map,None,255,0,cv.NORM_MINMAX, cv.CV_8U)
-            disp_msg = self.bridge.cv2_to_imgmsg(disparity_map)
-            disp_msg.header = header
-            self.publisher.publish(disp_msg)
-  
+            self.publish(disparity_map, header)
+
+
+class Map3D(Node):
+    def __init__(self):
+        super().__init__('map_3d')
+        self.bridge = CvBridge()
+        self.publisher = self.create_publisher(PointCloud2, '/stereo/map_3d', 10)
+        self.Q = None 
+
+    def setQ(self, Q):
+        self.Q = Q
+        
+    def set_info(self, disparity, header):
+        return
+        # self.compute(disparity, header)
+
+    def compute(self, disparity, header):
+        if self.Q is not None:
+            # Reescalar la disparidad
+            disparity = disparity.astype(np.float32) / 16.0
+            # Reproyectar a 3D
+            points_3d = cv.reprojectImageTo3D(disparity, self.Q)
+            # points_3d = points_3d.reshape(-1, 3)
+            # valid_points = points_3d[~np.isnan(points_3d[:,2]) & ~np.isinf(points_3d[:,2]) & (points_3d[:,2] != 0)]
+            # print(f"Number of valid 3D points: {len(valid_points)}")
+            mask = disparity > disparity.min()
+            points_3d = points_3d[mask]
+            points_3d = points_3d[ ~np.isnan(points_3d[:,2]) & ~np.isinf(points_3d[:,2]) & (points_3d[:,2] != 0)]
+            # print(f"Number of valid 3D points after filtering: {len(points_3d)}")
+            # print(points_3d)
+
+            msg = create_pointcloud2(points_3d[:] / 1000, header)
+            self.publisher.publish(msg)
+            
+
+
 def main(args=None):
     rclpy.init(args=args)
     print("Starting bag player")
     bag_player = BagPlayer()
     executor = MultiThreadedExecutor()
     executor.add_node(bag_player)
+    print("Starting 3D mapper")
+    map3d = Map3D()
+    # executor.add_node(map3d)
     print("Starting image rectifier")
-    rectifier = ImageRectifier()
+    rectifier = ImageRectifier(map3d)
     executor.add_node(rectifier)
     print("Starting image disparity")
-    dispMap = DisparityMap()
+    dispMap = DisparityMap(map3d)
     executor.add_node(dispMap)
     print("starting Triangulation")
-    # triangulation = TriangulatePoints()
-    triangulation = TriangulatedPointsRansac()
+    triangulation = TriangulatePoints()
+    # triangulation = TriangulatedPointsRansac()    
     executor.add_node(triangulation)
     print("Starting matcher")
     matcher = Matcher(triangulation)
@@ -341,6 +388,7 @@ def main(args=None):
         executor.shutdown()
         bag_player.destroy_node()
         rectifier.destroy_node()
+        map3d.destroy_node()
         dispMap.destroy_node()
         keyDetectorL.destroy_node()
         keyDetectorR.destroy_node()

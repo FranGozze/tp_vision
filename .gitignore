@@ -4,3 +4,4 @@ bags/bags.db3
 bags/metadata.yaml
 cam_checkerboard.bag
 calibrationdata/
+aux.txt
