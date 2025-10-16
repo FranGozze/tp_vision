@@ -154,7 +154,7 @@ class Matcher(Node):
             
 
 class KeypointDetector(Node):
-    def __init__(self, side, matcher):
+    def __init__(self, side, matcher, estimator=None):
         super().__init__('keypoint_detector')
         self.bridge = CvBridge()
         self.orb = cv.ORB_create()
@@ -165,6 +165,7 @@ class KeypointDetector(Node):
         self.publisher = self.create_publisher(Image, f'/stereo/{side}/image_keypoints', 10)
         self.side = side
         self.matcher = matcher
+        self.estimator = estimator
 
     def listener_callback(self, msg):
         img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -181,6 +182,8 @@ class KeypointDetector(Node):
             # 'stamp': msg.header.stamp
         }
         self.matcher.set_info(info, self.side)
+        if self.estimator is not None:
+            self.estimator.set_info(info, self.side)
 
         # Dibujar los puntos en la imagen
         output_image = cv.drawKeypoints(img, keypoints,None,color=(0,255,0))
@@ -352,12 +355,70 @@ class Map3D(Node):
             self.publisher.publish(msg)
             
 
+class EstimatePose(Node):
+    def __init__(self):
+        super().__init__('estimate_pose')
+        self.bridge = CvBridge()
+        self.calculated = False
+        self.info = {}
+        calib_data_left = load_calibration_data(f'calibrationdata/left.yaml')
+        calib_data_right = load_calibration_data(f'calibrationdata/right.yaml')
+        
+        self.K1 = np.array(calib_data_left['camera_matrix']['data']).reshape(3, 3)
+        self.K2 = np.array(calib_data_right['camera_matrix']['data']).reshape(3, 3)
+
+        self.baseline = abs(calib_data_right['projection_matrix']['data'][3])
+        print("Baseline (m): ", self.baseline / 1000)
+        
+    def set_info(self, info, side):
+        stamp = info['header'].stamp
+        stamp_obj = (stamp.sec, stamp.nanosec)
+        if stamp_obj not in self.info:
+            self.info[stamp_obj] = {}
+        self.info[stamp_obj][side] = info
+        self.compute(stamp_obj)
+    def compute(self, stamp):
+        if not self.calculated:
+            if stamp in self.info and "left" in self.info[stamp] and "right" in self.info[stamp]:
+                left = self.info[stamp]["left"]
+                right = self.info[stamp]["right"]
+                # print([kp.pt for kp in left['keypoints']])
+                point1 = np.array([kp.pt for kp in left['keypoints']])
+                point2 = np.array([kp.pt for kp in right['keypoints']])
+
+                E, mask = cv.findEssentialMat(  point1, 
+                                                point2,
+                                                self.K1,
+                                                method=cv.RANSAC, 
+                                                prob=0.999, 
+                                                threshold=1.0)
+                _, R, t, mask = cv.recoverPose(E, point1, point2, mask=mask)
+
+                t = t * self.baseline / 1000  # Convertir a metros
+
+                print("Essential Matrix:\n", E)
+                print("Rotation:\n", R)
+                print("Translation:\n", t)
+                
+                
+                fig = plt.figure()
+                ax = fig.add_subplot(111, projection='3d')
+                ax.scatter(0, 0, 0, c='r', marker='o', s=100, label='Camera Center', color = 'blue')
+                ax.scatter(t[0], t[1], t[2], c='r', marker='o', s=100, label='Translation t', color = 'red')
+                ax.set_xlabel('X')
+                ax.set_ylabel('Y')
+                ax.set_zlabel('Z')
+                ax.set_title('Estimated Translation Vector t')
+                ax.legend()
+                plt.show()
+                
+                self.calculated = True
 
 def main(args=None):
     rclpy.init(args=args)
+    executor = MultiThreadedExecutor()
     print("Starting bag player")
     bag_player = BagPlayer()
-    executor = MultiThreadedExecutor()
     executor.add_node(bag_player)
     print("Starting 3D mapper")
     map3d = Map3D()
@@ -375,9 +436,12 @@ def main(args=None):
     print("Starting matcher")
     matcher = Matcher(triangulation)
     executor.add_node(matcher)
+    print("Starting pose estimator")
+    estimator = EstimatePose()
+    # executor.add_node(estimator)
     print("Starting keypoint detector")
-    keyDetectorL = KeypointDetector("left", matcher)    
-    keyDetectorR = KeypointDetector("right", matcher)
+    keyDetectorL = KeypointDetector("left", matcher, estimator)
+    keyDetectorR = KeypointDetector("right", matcher, estimator)
     executor.add_node(keyDetectorL)
     executor.add_node(keyDetectorR)
     try:
