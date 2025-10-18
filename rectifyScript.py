@@ -2,6 +2,7 @@ import cv2 as cv
 import numpy as np
 from matplotlib import pyplot as plt
 import yaml
+import pandas as pd
 import sys
 import rclpy
 from rclpy.node import Node
@@ -44,6 +45,7 @@ class BagPlayer(Node):
                 break  # Publicar solo un mensaje por llamada al timer
             else:
                 continue
+        raise KeyboardInterrupt
 
 
 class ImageRectifier(Node):
@@ -367,8 +369,8 @@ class EstimatePose(Node):
         self.K1 = np.array(calib_data_left['camera_matrix']['data']).reshape(3, 3)
         self.K2 = np.array(calib_data_right['camera_matrix']['data']).reshape(3, 3)
 
-        self.baseline = abs(calib_data_right['projection_matrix']['data'][3])
-        print("Baseline (m): ", self.baseline / 1000)
+        self.baseline = abs(calib_data_right['projection_matrix']['data'][3]) / 1000  # Convertir a metros
+        print("Baseline (m): ", self.baseline)
         
     def set_info(self, info, side):
         stamp = info['header'].stamp
@@ -392,27 +394,105 @@ class EstimatePose(Node):
                                                 method=cv.RANSAC, 
                                                 prob=0.999, 
                                                 threshold=1.0)
-                _, R, t, mask = cv.recoverPose(E, point1, point2, mask=mask)
 
-                t = t * self.baseline / 1000  # Convertir a metros
+                inliers1 = point1[mask]
+                inliers2 = point2[mask]
 
-                print("Essential Matrix:\n", E)
-                print("Rotation:\n", R)
-                print("Translation:\n", t)
-                
-                
-                fig = plt.figure()
-                ax = fig.add_subplot(111, projection='3d')
-                ax.scatter(0, 0, 0, c='r', marker='o', s=100, label='Camera Center', color = 'blue')
-                ax.scatter(t[0], t[1], t[2], c='r', marker='o', s=100, label='Translation t', color = 'red')
-                ax.set_xlabel('X')
-                ax.set_ylabel('Y')
-                ax.set_zlabel('Z')
-                ax.set_title('Estimated Translation Vector t')
-                ax.legend()
-                plt.show()
-                
-                self.calculated = True
+                _, R, t, mask = cv.recoverPose(E, inliers1, inliers2, mask=mask, cameraMatrix=self.K1)
+
+                t = t * self.baseline
+                self.show(R,t)
+    def show(self, R, t):
+        pass
+class ShowEstimatePoseLR(EstimatePose):
+    def __init__(self):
+        super().__init__()
+    def show(self, R, t):  
+        # Plot origin and translation vector t in 3D
+        try:
+          origin = np.zeros(3)
+          tvec = np.asarray(t).ravel()
+
+          fig = plt.figure(figsize=(6,6))
+          ax = fig.add_subplot(111, projection='3d')
+          ax.scatter(*origin, color='red', s=50, label='origin (0,0,0)')
+          ax.scatter(tvec[0], tvec[1], tvec[2], color='blue', s=50, label='t')
+          ax.plot([0, tvec[0]], [0, tvec[1]], [0, tvec[2]], color='gray', linestyle='--')
+
+          # Set equal scaling
+          pts = np.vstack((origin, tvec))
+          max_range = np.max(np.ptp(pts, axis=0))
+          if max_range == 0:
+            max_range = 1.0
+          mid = np.mean(pts, axis=0)
+          ax.set_xlim(mid[0] - max_range/2, mid[0] + max_range/2)
+          ax.set_ylim(mid[1] - max_range/2, mid[1] + max_range/2)
+          ax.set_zlim(mid[2] - max_range/2, mid[2] + max_range/2)
+
+          ax.set_xlabel('X (m)')
+          ax.set_ylabel('Y (m)')
+          ax.set_zlabel('Z (m)')
+          ax.legend()
+          plt.savefig('pose_estimation.png')
+          
+        except Exception as e:
+          print("Could not plot 3D points:", e)
+        self.calculated = True
+
+def get_distance(ts,x,y,z):
+        distance = np.sqrt(x**2 + y**2 + z**2)
+        time = ts * 1e-9
+        return time, distance
+
+class EstimateTrayectory(EstimatePose):
+    def __init__(self):
+        super().__init__()
+        self.info = []
+        self.ground_truth = []
+        df = pd.read_csv('ground_truth.csv')
+        for index, row in df.iterrows():
+            self.ground_truth.append(get_distance(row[0], row[1], row[2], row[3]))
+        self.trayectory = []
+    def set_info(self, info, side):
+        if side == "left":
+            self.compute(info)
+    
+    def compute(self, point):
+        if len(self.info) == 0:
+            self.trayectory.append((0,0,0))
+        else:
+            last_point = np.array([kp.pt for kp in self.trayectory[-1]['keypoints']])
+            new_point = np.array([kp.pt for kp in point['keypoints']])
+            self.info.append(point)
+            E, mask = cv.findEssentialMat(  last_point, 
+                                            new_point,
+                                            self.K1,
+                                            method=cv.RANSAC, 
+                                            prob=0.999, 
+                                            threshold=1.0)
+
+            inliers1 = last_point[mask]
+            inliers2 = new_point[mask]
+
+            _, R, t, mask = cv.recoverPose(E, inliers1, inliers2, mask=mask, cameraMatrix=self.K1)
+            t = t * self.ground_truth[len(self.info)][1]
+            self.trayectory.append(np.dot(R, t))
+
+    def show(self, R, t):
+        fig = plt.figure(figsize=(10, 6))
+        ax = fig.add_subplot(111)
+        x = [e[0] for e in self.trayectory]
+        y = [e[1] for e in self.trayectory]
+        z = [e[2] for e in self.trayectory]
+        # times = [e[0] for e in self.ground_truth]
+        ax.plot(x, y, z, c='red', label='Estimated Path', alpha=0.7, linewidth=0.75)
+        ax.set_xlabel('X-axis')
+        ax.set_ylabel('Y-axis')
+        ax.set_zlabel('Z-axis')
+        ax.set_title('3D Estimated Left Camera Path')
+        ax.legend()
+
+        plt.savefig('LeftCameraPath.svg')
 
 def main(args=None):
     rclpy.init(args=args)
@@ -437,10 +517,11 @@ def main(args=None):
     matcher = Matcher(triangulation)
     executor.add_node(matcher)
     print("Starting pose estimator")
-    estimator = EstimatePose()
+    estimator = ShowEstimatePoseLR()
+    pathEstimator = EstimateTrayectory()
     # executor.add_node(estimator)
     print("Starting keypoint detector")
-    keyDetectorL = KeypointDetector("left", matcher, estimator)
+    keyDetectorL = KeypointDetector("left", matcher, pathEstimator)
     keyDetectorR = KeypointDetector("right", matcher, estimator)
     executor.add_node(keyDetectorL)
     executor.add_node(keyDetectorR)
@@ -458,6 +539,8 @@ def main(args=None):
         keyDetectorR.destroy_node()
         matcher.destroy_node()
         triangulation.destroy_node()
+        pathEstimator.show()
+        pathEstimator.destroy_node()
         rclpy.shutdown()
 
 if __name__ == '__main__':
