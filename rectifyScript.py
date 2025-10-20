@@ -5,6 +5,7 @@ import yaml
 import pandas as pd
 import sys
 import rclpy
+import transforms3d
 from rclpy.node import Node
 from sensor_msgs.msg import Image, PointCloud2, PointField
 from cv_bridge import CvBridge
@@ -156,8 +157,8 @@ class Matcher(Node):
             
 
 class KeypointDetector(Node):
-    def __init__(self, side, matcher, estimator=None):
-        super().__init__('keypoint_detector')
+    def __init__(self, side, dependencies, node_name='keypoint_detector'):
+        super().__init__(node_name)
         self.bridge = CvBridge()
         self.orb = cv.ORB_create()
         self.subscription_left = self.create_subscription(
@@ -166,8 +167,7 @@ class KeypointDetector(Node):
             self.listener_callback, 10)
         self.publisher = self.create_publisher(Image, f'/stereo/{side}/image_keypoints', 10)
         self.side = side
-        self.matcher = matcher
-        self.estimator = estimator
+        self.dependencies = dependencies
 
     def listener_callback(self, msg):
         img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -183,10 +183,8 @@ class KeypointDetector(Node):
             'header': msg.header
             # 'stamp': msg.header.stamp
         }
-        self.matcher.set_info(info, self.side)
-        if self.estimator is not None:
-            self.estimator.set_info(info, self.side)
-
+        for dependency in self.dependencies:
+            dependency.set_info(info, self.side)
         # Dibujar los puntos en la imagen
         output_image = cv.drawKeypoints(img, keypoints,None,color=(0,255,0))
         # output_image = cv.drawKeypoints(img, keypoints, img, flags=cv.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
@@ -329,14 +327,18 @@ class Map3D(Node):
         super().__init__('map_3d')
         self.bridge = CvBridge()
         self.publisher = self.create_publisher(PointCloud2, '/stereo/map_3d', 10)
+        # definimos la matriz de rotacion para girar la proyeccion 3d 90 grados en x
+        self.RMatrix = np.array([[0, 0, -1],
+                                 [0, -1, 0],
+                                 [1, 0, 0]])
         self.Q = None 
 
     def setQ(self, Q):
         self.Q = Q
         
     def set_info(self, disparity, header):
-        return
-        # self.compute(disparity, header)
+        # return
+        self.compute(disparity, header)
 
     def compute(self, disparity, header):
         if self.Q is not None:
@@ -344,6 +346,8 @@ class Map3D(Node):
             disparity = disparity.astype(np.float32) / 16.0
             # Reproyectar a 3D
             points_3d = cv.reprojectImageTo3D(disparity, self.Q)
+            
+            
             # points_3d = points_3d.reshape(-1, 3)
             # valid_points = points_3d[~np.isnan(points_3d[:,2]) & ~np.isinf(points_3d[:,2]) & (points_3d[:,2] != 0)]
             # print(f"Number of valid 3D points: {len(valid_points)}")
@@ -352,15 +356,18 @@ class Map3D(Node):
             points_3d = points_3d[ ~np.isnan(points_3d[:,2]) & ~np.isinf(points_3d[:,2]) & (points_3d[:,2] != 0)]
             # print(f"Number of valid 3D points after filtering: {len(points_3d)}")
             # print(points_3d)
+            # Aplicar la rotación para corregir la orientación
+            points_3d = points_3d.reshape(-1, 3) @ self.RMatrix.T
 
             msg = create_pointcloud2(points_3d[:] / 1000, header)
             self.publisher.publish(msg)
             
 
 class EstimatePose(Node):
-    def __init__(self):
-        super().__init__('estimate_pose')
+    def __init__(self, node_name='estimate_pose'):
+        super().__init__(node_name)
         self.bridge = CvBridge()
+        self.bf = cv.BFMatcher(cv.NORM_HAMMING, crossCheck=True)
         self.calculated = False
         self.info = {}
         calib_data_left = load_calibration_data(f'calibrationdata/left.yaml')
@@ -368,7 +375,7 @@ class EstimatePose(Node):
         
         self.K1 = np.array(calib_data_left['camera_matrix']['data']).reshape(3, 3)
         self.K2 = np.array(calib_data_right['camera_matrix']['data']).reshape(3, 3)
-
+        self.t = None
         self.baseline = abs(calib_data_right['projection_matrix']['data'][3]) / 1000  # Convertir a metros
         print("Baseline (m): ", self.baseline)
         
@@ -384,9 +391,11 @@ class EstimatePose(Node):
             if stamp in self.info and "left" in self.info[stamp] and "right" in self.info[stamp]:
                 left = self.info[stamp]["left"]
                 right = self.info[stamp]["right"]
+                matches = self.bf.match(left['descriptors'], right['descriptors'])
+                matches = sorted(matches, key=lambda x: x.distance)
                 # print([kp.pt for kp in left['keypoints']])
-                point1 = np.array([kp.pt for kp in left['keypoints']])
-                point2 = np.array([kp.pt for kp in right['keypoints']])
+                point1 = np.float32([left['keypoints'][m.queryIdx].pt for m in matches])
+                point2 =  np.float32([right['keypoints'][m.trainIdx].pt for m in matches])
 
                 E, mask = cv.findEssentialMat(  point1, 
                                                 point2,
@@ -400,18 +409,18 @@ class EstimatePose(Node):
 
                 _, R, t, mask = cv.recoverPose(E, inliers1, inliers2, mask=mask, cameraMatrix=self.K1)
 
-                t = t * self.baseline
-                self.show(R,t)
+                t = t * self.baseline                
+                self.t = t
     def show(self, R, t):
         pass
 class ShowEstimatePoseLR(EstimatePose):
     def __init__(self):
-        super().__init__()
-    def show(self, R, t):  
+        super().__init__(node_name='show_estimate_pose_lr')
+    def show(self, R = None, t = None):  
         # Plot origin and translation vector t in 3D
         try:
           origin = np.zeros(3)
-          tvec = np.asarray(t).ravel()
+          tvec = np.asarray(self.t).ravel()
 
           fig = plt.figure(figsize=(6,6))
           ax = fig.add_subplot(111, projection='3d')
@@ -434,38 +443,58 @@ class ShowEstimatePoseLR(EstimatePose):
           ax.set_zlabel('Z (m)')
           ax.legend()
           plt.savefig('pose_estimation.png')
-          
+          plt.close()
         except Exception as e:
           print("Could not plot 3D points:", e)
         self.calculated = True
 
-def get_distance(ts,x,y,z):
-        distance = np.sqrt(x**2 + y**2 + z**2)
-        time = ts * 1e-9
-        return time, distance
+def get_distance(x,y,z):
+    distance = np.sqrt(x**2 + y**2 + z**2)  / 10
+    return  distance
 
-class EstimateTrayectory(EstimatePose):
+def transformPath(x,y,z,qw,qx,qy,qz):
+    rotation = transforms3d.quaternions.quat2mat([qw, qx, qy, qz])
+    translation = np.array([x, y, z]).reshape((3, 1))
+    # Creamos la matriz de rototraslacion
+    transform = np.vstack((np.hstack((rotation, translation)), [0, 0, 0, 1]))
+    # Suponiendo que timestamp esta en ticks pasamos a segundos
+
+    return transform
+
+class EstimatePath(EstimatePose):
     def __init__(self):
-        super().__init__()
+        super().__init__(node_name='estimate_path')
+        # info is the list of keypoints
         self.info = []
         self.ground_truth = []
-        df = pd.read_csv('ground_truth.csv')
+        df = pd.read_csv('ground_truth.csv', header=0)
         for index, row in df.iterrows():
-            self.ground_truth.append(get_distance(row[0], row[1], row[2], row[3]))
-        self.trayectory = []
+            self.ground_truth.append((row['#time(ns)'] * 1e-9,get_distance(row['px'], row['py'], row['pz']),transformPath(row['px'], row['py'], row['pz'], row['qw'], row['qx'], row['qy'], row['qz'])))
+        # path is the list of positions
+        self.path = []
+        # self.trajectory = [np.eye(4)]
+        xi = load_calibration_data(f'kalibr_imucam_chain.yaml')
+        self.ImuToCam =  np.array(xi['cam0']['T_imu_cam']).reshape(4,4)
+        self.trajectory = [np.eye(4)]
+        self.CamToIMU =  np.linalg.inv(self.ImuToCam)
     def set_info(self, info, side):
         if side == "left":
             self.compute(info)
     
     def compute(self, point):
         if len(self.info) == 0:
-            self.trayectory.append((0,0,0))
-        else:
-            last_point = np.array([kp.pt for kp in self.trayectory[-1]['keypoints']])
-            new_point = np.array([kp.pt for kp in point['keypoints']])
             self.info.append(point)
-            E, mask = cv.findEssentialMat(  last_point, 
-                                            new_point,
+            # self.path.append((np.array([0,0,0,1]), np.eye(4)))
+        else:
+            last_point_info = self.info[-1]
+            matches = self.bf.match(last_point_info['descriptors'], point['descriptors'])
+            matches = sorted(matches, key=lambda x: x.distance)
+            # print([kp.pt for kp in left['keypoints']])
+            last_point = np.float32([last_point_info['keypoints'][m.queryIdx].pt for m in matches])
+            new_point =  np.float32([point['keypoints'][m.trainIdx].pt for m in matches])
+            self.info.append(point)
+            E, mask = cv.findEssentialMat(  new_point, 
+                                            last_point,
                                             self.K1,
                                             method=cv.RANSAC, 
                                             prob=0.999, 
@@ -474,25 +503,49 @@ class EstimateTrayectory(EstimatePose):
             inliers1 = last_point[mask]
             inliers2 = new_point[mask]
 
-            _, R, t, mask = cv.recoverPose(E, inliers1, inliers2, mask=mask, cameraMatrix=self.K1)
-            t = t * self.ground_truth[len(self.info)][1]
-            self.trayectory.append(np.dot(R, t))
+            _, R, t, mask = cv.recoverPose(E, inliers2, inliers1, mask=mask, cameraMatrix=self.K1)
+            # print(f"Pre escalado: {t}")
+            baseline = self.ground_truth[len(self.info)][1]
+            t = t * baseline
+            T = np.vstack((np.hstack((R, t)), [0, 0, 0, 1]))
+            self.trajectory.append(self.trajectory[-1] @ np.linalg.inv(T))
+            # print(f"Post escalado: {t}, escala: {self.ground_truth[len(self.info)][1]}")
+            # xi_camera_i_to_next = np.vstack((np.hstack((R, t)), [0, 0, 0, 1]))
+            # last_pose = self.path[-1][1].reshape(4,4)
+            
+            # self.path.append((np.dot(last_pose, np.vstack((t,[1]))).ravel(), xi_camera_i_to_next))
 
-    def show(self, R, t):
-        fig = plt.figure(figsize=(10, 6))
-        ax = fig.add_subplot(111)
-        x = [e[0] for e in self.trayectory]
-        y = [e[1] for e in self.trayectory]
-        z = [e[2] for e in self.trayectory]
+    def show(self, R=None, t=None):
+        # print(self.path)
+        fig = plt.figure(figsize=(10, 6))        
+        ax = fig.add_subplot(111, projection='3d')
+        aux_traj = self.trajectory
+        poses = np.array([traj[:3, 3] for traj in aux_traj])
+        x = poses[:, 0]
+        y = poses[:, 1]
+        z = poses[:, 2]
+        # x = [e[0][0] for e in self.path]
+        # y = [e[0][1] for e in self.path]
+        # z = [e[0][2] for e in self.path]
+        gt = [e[2] for e in self.ground_truth] @ self.ImuToCam
+        gxs = [e[:3,3][0] for e in gt]
+        gys = [e[:3,3][1] for e in gt]
+        gzs = [e[:3,3][2] for e in gt]
         # times = [e[0] for e in self.ground_truth]
         ax.plot(x, y, z, c='red', label='Estimated Path', alpha=0.7, linewidth=0.75)
+        sc2 = ax.plot(gxs, gys, gzs, c='blue', label='Ground Truth Path', alpha=0.7, linewidth=0.75)
+        print("Initial Position GT: ", gxs[0], gys[0], gzs[0])
+        print("Initial Position Est: ", x[0], y[0], z[0])
+        ax.scatter(gxs[0],gys[0],gzs[0], color='green', s=50, label='origin gt')
+        ax.scatter(x[0],y[0],z[0], color='yellow', s=50, label='origin est')
         ax.set_xlabel('X-axis')
         ax.set_ylabel('Y-axis')
-        ax.set_zlabel('Z-axis')
+        ax.set_zlabel('Z (m)')
         ax.set_title('3D Estimated Left Camera Path')
         ax.legend()
 
         plt.savefig('LeftCameraPath.svg')
+        plt.close()
 
 def main(args=None):
     rclpy.init(args=args)
@@ -518,11 +571,11 @@ def main(args=None):
     executor.add_node(matcher)
     print("Starting pose estimator")
     estimator = ShowEstimatePoseLR()
-    pathEstimator = EstimateTrayectory()
+    pathEstimator = EstimatePath()
     # executor.add_node(estimator)
     print("Starting keypoint detector")
-    keyDetectorL = KeypointDetector("left", matcher, pathEstimator)
-    keyDetectorR = KeypointDetector("right", matcher, estimator)
+    keyDetectorL = KeypointDetector("left", [matcher, estimator, pathEstimator], node_name='keypoint_detector_left')
+    keyDetectorR = KeypointDetector("right", [matcher, estimator], node_name='keypoint_detector_right')
     executor.add_node(keyDetectorL)
     executor.add_node(keyDetectorR)
     try:
@@ -539,6 +592,7 @@ def main(args=None):
         keyDetectorR.destroy_node()
         matcher.destroy_node()
         triangulation.destroy_node()
+        estimator.show()
         pathEstimator.show()
         pathEstimator.destroy_node()
         rclpy.shutdown()
