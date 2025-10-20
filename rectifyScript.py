@@ -24,7 +24,6 @@ class BagPlayer(Node):
     def __init__(self):
         super().__init__('bag_player')
         self.bridge = CvBridge()
-        self.timer = self.create_timer(0.1, self.timer_callback)  # Publicar cada 0.1 segundos
         self.reader = SequentialReader()
         try:
             self.reader.open(StorageOptions(uri='V1_01_easy'), ConverterOptions( input_serialization_format='cdr', output_serialization_format='cdr'))
@@ -475,25 +474,26 @@ class EstimatePath(EstimatePose):
         # self.trajectory = [np.eye(4)]
         xi = load_calibration_data(f'kalibr_imucam_chain.yaml')
         self.ImuToCam =  np.array(xi['cam0']['T_imu_cam']).reshape(4,4)
-        self.trajectory = [np.eye(4)]
+        self.trajectory = [self.ground_truth[0][2] @ self.ImuToCam]
         self.CamToIMU =  np.linalg.inv(self.ImuToCam)
     def set_info(self, info, side):
         if side == "left":
-            self.compute(info)
+            self.info.append(info)
     
-    def compute(self, point):
-        if len(self.info) == 0:
-            self.info.append(point)
-            # self.path.append((np.array([0,0,0,1]), np.eye(4)))
-        else:
-            last_point_info = self.info[-1]
+    def compute(self):
+        # Sort collected frames by their ROS2 header timestamp (sec, nanosec)        
+        self.info.sort(key=lambda x: (x['header'].stamp.sec, x['header'].stamp.nanosec))
+        for i in range(1,len(self.info)):
+            last_point_info = self.info[i-1]
+            point = self.info[i]
             matches = self.bf.match(last_point_info['descriptors'], point['descriptors'])
             matches = sorted(matches, key=lambda x: x.distance)
             # print([kp.pt for kp in left['keypoints']])
             last_point = np.float32([last_point_info['keypoints'][m.queryIdx].pt for m in matches])
             new_point =  np.float32([point['keypoints'][m.trainIdx].pt for m in matches])
             self.info.append(point)
-            E, mask = cv.findEssentialMat(  new_point, 
+            E, mask = cv.findEssentialMat(  
+                                            new_point, 
                                             last_point,
                                             self.K1,
                                             method=cv.RANSAC, 
@@ -505,16 +505,16 @@ class EstimatePath(EstimatePose):
 
             _, R, t, mask = cv.recoverPose(E, inliers2, inliers1, mask=mask, cameraMatrix=self.K1)
             # print(f"Pre escalado: {t}")
-            baseline = self.ground_truth[len(self.info)][1]
+            baseline = self.ground_truth[i][1]
             t = t * baseline
             T = np.vstack((np.hstack((R, t)), [0, 0, 0, 1]))
-            self.trajectory.append(self.trajectory[-1] @ np.linalg.inv(T))
+            self.trajectory.append(self.trajectory[i-1] @ np.linalg.inv(T))
             # print(f"Post escalado: {t}, escala: {self.ground_truth[len(self.info)][1]}")
             # xi_camera_i_to_next = np.vstack((np.hstack((R, t)), [0, 0, 0, 1]))
             # last_pose = self.path[-1][1].reshape(4,4)
             
             # self.path.append((np.dot(last_pose, np.vstack((t,[1]))).ravel(), xi_camera_i_to_next))
-
+        self.show()
     def show(self, R=None, t=None):
         # print(self.path)
         fig = plt.figure(figsize=(10, 6))        
@@ -527,7 +527,15 @@ class EstimatePath(EstimatePose):
         # x = [e[0][0] for e in self.path]
         # y = [e[0][1] for e in self.path]
         # z = [e[0][2] for e in self.path]
-        gt = [e[2] for e in self.ground_truth] @ self.ImuToCam
+        # gt = [e[2] for e in self.ground_truth] @ self.ImuToCam
+        # keep only the first half of ground truth poses (after transforming by ImuToCam)
+        gt_mats = [e[2] for e in self.ground_truth]
+        half_count = len(gt_mats) // 2
+        if half_count == 0:
+            # if there are less than 2 entries, keep all
+            gt = [mat @ self.ImuToCam for mat in gt_mats]
+        else:
+            gt = [mat @ self.ImuToCam for mat in gt_mats[:half_count]]
         gxs = [e[:3,3][0] for e in gt]
         gys = [e[:3,3][1] for e in gt]
         gzs = [e[:3,3][2] for e in gt]
@@ -583,6 +591,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        print("Finished reproducing bag file.")
         executor.shutdown()
         bag_player.destroy_node()
         rectifier.destroy_node()
@@ -593,7 +602,7 @@ def main(args=None):
         matcher.destroy_node()
         triangulation.destroy_node()
         estimator.show()
-        pathEstimator.show()
+        pathEstimator.compute()
         pathEstimator.destroy_node()
         rclpy.shutdown()
 
