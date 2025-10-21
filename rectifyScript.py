@@ -385,10 +385,10 @@ class DisparityMap(Node):
 
 
 class Map3D(Node):
-    def __init__(self):
-        super().__init__('map_3d')
+    def __init__(self, node_name='map_3d'):
+        super().__init__(node_name)
         self.bridge = CvBridge()
-        self.publisher = self.create_publisher(PointCloud2, '/stereo/map_3d', 10)
+        self.publisher = self.create_publisher(PointCloud2, f'/stereo/{node_name}', 10)
         # definimos la matriz de rotacion para girar la proyeccion 3d 90 grados en x
         self.RMatrix = np.array([[0, 0, -1],
                                  [0, -1, 0],
@@ -419,11 +419,41 @@ class Map3D(Node):
             # print(f"Number of valid 3D points after filtering: {len(points_3d)}")
             # print(points_3d)
             # Aplicar la rotación para corregir la orientación
-            points_3d = points_3d.reshape(-1, 3) @ self.RMatrix.T
+            points_3d = points_3d.reshape(-1, 3)
 
             msg = create_pointcloud2(points_3d[:] / 1000, header)
             self.publisher.publish(msg)
-            
+
+class Map3dDense(Map3D):
+    def __init__(self):
+        super().__init__('map_3d_dense')
+        self.frame = 0
+        self.accumulated_points = []
+
+    def compute(self, disparity, header):
+        if self.Q is not None:
+            # Reescalar la disparidad
+            disparity = disparity.astype(np.float32) / 16.0
+            # Reproyectar a 3D
+            points_3d = cv.reprojectImageTo3D(disparity, self.Q)
+            mask = disparity > disparity.min()
+            points_3d = points_3d[mask]
+            points_3d = points_3d[ ~np.isnan(points_3d[:,2]) & ~np.isinf(points_3d[:,2]) & (points_3d[:,2] != 0)]
+            points_3d = points_3d.reshape(-1, 3)
+            gt_transform = ground_truth[self.frame][2]
+            R = gt_transform[:3, :3]
+            t = gt_transform[:3, 3].reshape(3, 1)
+            world_points = []
+            for point in points_3d:
+                newPoint = R @ point.T
+                newPoint[0] += t[0]
+                newPoint[1] += t[1]
+                newPoint[2] += t[2]                
+                world_points.append(newPoint / 1000)
+            # all_points = np.vstack(self.accumulated_points)
+            msg = create_pointcloud2(np.array(world_points), header)
+            self.publisher.publish(msg)      
+        self.frame += 1 
 
 class EstimatePose(Node):
     def __init__(self, node_name='estimate_pose'):
@@ -609,7 +639,8 @@ def main(args=None):
     bag_player = BagPlayer()
     executor.add_node(bag_player)
     print("Starting 3D mapper")
-    map3d = Map3D()
+    # map3d = Map3D()
+    map3d = Map3dDense()
     # executor.add_node(map3d)
     print("Starting image rectifier")
     rectifier = ImageRectifier(map3d)
@@ -641,10 +672,6 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        print("Finished reproducing bag file.")
-        mappingPoints.compute()
-        print("Waiting 10 seconds...")
-        time.sleep(10)
         executor.shutdown()
         bag_player.destroy_node()
         rectifier.destroy_node()
