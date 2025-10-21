@@ -14,6 +14,7 @@ from rclpy.executors import MultiThreadedExecutor
 from datetime import datetime as time
 import struct
 from std_msgs.msg import Header
+import time
 
 def load_calibration_data(file_path):
     with open(file_path, 'r') as file:
@@ -299,30 +300,31 @@ class  MappingPoints(Node):
     def __init__(self, node_name='mapping_points'):
         super().__init__(node_name)
         self.bridge = CvBridge()
-        self.publisher = self.create_publisher(PointCloud2, '/stereo/mapped_points', 10)
+        self.publisher = self.create_publisher(PointCloud2, '/stereo/mapped_triangulated_points', 10)
         self.points_3d = []
 
     def set_info(self, points, header):
         self.points_3d.append((points, header))
-        self.compute()
+        self.compute(points,header)
 
-    def compute(self):
+    def compute(self, points, header):
         world = []
-        for index in range(min(len(self.points_3d), len(ground_truth))):
-            points = self.points_3d[index][0]
-            header = self.points_3d[index][1]
-            gt_transform = ground_truth[index][2]
-            points_world = []
-            R = gt_transform[:3, :3]
-            t = gt_transform[:3, 3].reshape(3, 1)
-            for point in points:
-                newPoint = R @ point.T
-                newPoint[0] += t[0]
-                newPoint[1] += t[1]
-                newPoint[2] += t[2]                
-                points_world.append(newPoint)
-            world.append(points_world)                       
-            self.publisher.publish(create_pointcloud2(np.array(points_world), header))        
+        # for index in range(min(len(self.points_3d), len(ground_truth))):
+            # points = self.points_3d[index][0]
+            # header = self.points_3d[index][1]
+        
+        gt_transform = ground_truth[len(self.points_3d)][2]
+        points_world = []
+        R = gt_transform[:3, :3]
+        t = gt_transform[:3, 3].reshape(3, 1)
+        for point in points:
+            newPoint = R @ point.T
+            newPoint[0] += t[0]
+            newPoint[1] += t[1]
+            newPoint[2] += t[2]                
+            # world.append(newPoint)
+            points_world.append(newPoint)
+        self.publisher.publish(create_pointcloud2(np.array(points_world), header))
         
 
 class DisparityMap(Node):
@@ -640,7 +642,9 @@ def main(args=None):
         pass
     finally:
         print("Finished reproducing bag file.")
-        # mappingPoints.compute()
+        mappingPoints.compute()
+        print("Waiting 10 seconds...")
+        time.sleep(10)
         executor.shutdown()
         bag_player.destroy_node()
         rectifier.destroy_node()
