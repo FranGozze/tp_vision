@@ -13,6 +13,7 @@ from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
 from rclpy.executors import MultiThreadedExecutor
 from datetime import datetime as time
 import struct
+from std_msgs.msg import Header
 
 def load_calibration_data(file_path):
     with open(file_path, 'r') as file:
@@ -239,8 +240,8 @@ def create_pointcloud2(points, header):
 
 
 class TriangulatePoints(Node):
-    def __init__(self):
-        super().__init__('triangulate_points')
+    def __init__(self, node_name='triangulate_points', map=None):
+        super().__init__(node_name)
         self.bridge = CvBridge()
         self.publisher = self.create_publisher(PointCloud2, '/stereo/triangulated_points', 10)
         calib_data_left = load_calibration_data(f'calibrationdata/left.yaml')
@@ -248,9 +249,11 @@ class TriangulatePoints(Node):
         projection_left = np.array(calib_data_left['projection_matrix']['data']).reshape(3, 4)
         projection_right = np.array(calib_data_right['projection_matrix']['data']).reshape(3, 4)
         self.projections = np.array([projection_left, projection_right])
+        self.map = map
     
     def publish(self, points, header):
         msg = create_pointcloud2(points, header)
+        
         self.publisher.publish(msg)
     
     def compute(self, matches, left_info, right_info):
@@ -258,14 +261,16 @@ class TriangulatePoints(Node):
         pts_right = np.float32([right_info['keypoints'][m.trainIdx].pt for m in matches])
         triangulatedPoints = cv.triangulatePoints(self.projections[0], self.projections[1], pts_left.T, pts_right.T)
         triangulatedPoints = (triangulatedPoints[:3] / triangulatedPoints[3]).T
+        if self.map is not None:
+            self.map.set_info(triangulatedPoints, left_info['header'])
         self.publish(triangulatedPoints, left_info['header'])
         
         # Publicar los puntos 3D como PointCloud2
 
 
 class TriangulatedPointsRansac(TriangulatePoints):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, node_name='triangulated_points_ransac', map=None):
+        super().__init__(node_name, map)
         self.publisherImg = self.create_publisher(Image, '/stereo/transformed_image', 10)
     
     def compute(self, matches, left_info, right_info):
@@ -288,6 +293,39 @@ class TriangulatedPointsRansac(TriangulatePoints):
         self.publisherImg.publish(msg)
 
         self.publish(triangulatedPoints, left_info['header'])
+
+
+class  MappingPoints(Node):
+    def __init__(self, node_name='mapping_points'):
+        super().__init__(node_name)
+        self.bridge = CvBridge()
+        self.publisher = self.create_publisher(PointCloud2, '/stereo/mapped_points', 10)
+        self.points_3d = []
+
+    def set_info(self, points, header):
+        print(points)
+        self.points_3d.append((points, header))
+        self.compute()
+
+    def compute(self):
+        world = []
+        for index in range(min(len(self.points_3d), len(ground_truth))):
+            points = self.points_3d[index][0]
+            header = self.points_3d[index][1]
+            gt_transform = ground_truth[index][2]
+            points_world = []
+            R = gt_transform[:3, :3]
+            t = gt_transform[:3, 3].reshape(3, 1)
+            for point in points:
+                newPoint = R @ point.T
+                newPoint[0] += t[0]
+                newPoint[1] += t[1]
+                newPoint[2] += t[2]                
+                points_world.append(newPoint)
+            world.append(points_world)                       
+            self.publisher.publish(create_pointcloud2(np.array(points_world), header))        
+        
+
 
 
 class DisparityMap(Node):
@@ -579,8 +617,11 @@ def main(args=None):
     print("Starting image disparity")
     dispMap = DisparityMap(map3d)
     executor.add_node(dispMap)
-    print("starting Triangulation")
-    triangulation = TriangulatePoints()
+    print("Starting mapping points from triangulation")
+    mappingPoints = MappingPoints()
+    executor.add_node(mappingPoints)
+    print("starting Triangulation")    
+    triangulation = TriangulatePoints(map=mappingPoints)
     # triangulation = TriangulatedPointsRansac()    
     executor.add_node(triangulation)
     print("Starting matcher")
@@ -601,6 +642,7 @@ def main(args=None):
         pass
     finally:
         print("Finished reproducing bag file.")
+        # mappingPoints.compute()
         executor.shutdown()
         bag_player.destroy_node()
         rectifier.destroy_node()
