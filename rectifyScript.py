@@ -19,6 +19,32 @@ def load_calibration_data(file_path):
         calib_data = yaml.safe_load(file)
     return calib_data
 
+ground_truth = []
+
+def get_distance(lastPoint, newPoint):
+    distance = np.sqrt((lastPoint[0] - newPoint[0])**2 + (lastPoint[1] - newPoint[1])**2 + (lastPoint[2] - newPoint[2])**2)
+    return  distance
+
+def transformPath(x,y,z,qw,qx,qy,qz):
+    rotation = transforms3d.quaternions.quat2mat([qw, qx, qy, qz])
+    translation = np.array([x, y, z]).reshape((3, 1))
+    # Creamos la matriz de rototraslacion
+    transform = np.vstack((np.hstack((rotation, translation)), [0, 0, 0, 1]))
+    # Suponiendo que timestamp esta en ticks pasamos a segundos
+
+    return transform
+
+def load_GT_data(file_path='ground_truth.csv'):
+    df = pd.read_csv(file_path, header=0)
+    for index, row in df.iterrows():
+        newPoint = np.array([row['px'], row['py'], row['pz']])
+        if index == 0:
+            lastPoint = newPoint
+        else:
+            lastPoint = ground_truth[-1][0]
+        distance = get_distance(lastPoint, newPoint)
+        ground_truth.append((newPoint, distance,transformPath(row['px'], row['py'], row['pz'], row['qw'], row['qx'], row['qy'], row['qz'])))
+    
 
 class BagPlayer(Node):
     def __init__(self):
@@ -447,34 +473,20 @@ class ShowEstimatePoseLR(EstimatePose):
           print("Could not plot 3D points:", e)
         self.calculated = True
 
-def get_distance(x,y,z):
-    distance = np.sqrt(x**2 + y**2 + z**2)  / 10
-    return  distance
 
-def transformPath(x,y,z,qw,qx,qy,qz):
-    rotation = transforms3d.quaternions.quat2mat([qw, qx, qy, qz])
-    translation = np.array([x, y, z]).reshape((3, 1))
-    # Creamos la matriz de rototraslacion
-    transform = np.vstack((np.hstack((rotation, translation)), [0, 0, 0, 1]))
-    # Suponiendo que timestamp esta en ticks pasamos a segundos
-
-    return transform
 
 class EstimatePath(EstimatePose):
     def __init__(self):
         super().__init__(node_name='estimate_path')
         # info is the list of keypoints
-        self.info = []
-        self.ground_truth = []
-        df = pd.read_csv('ground_truth.csv', header=0)
-        for index, row in df.iterrows():
-            self.ground_truth.append((row['#time(ns)'] * 1e-9,get_distance(row['px'], row['py'], row['pz']),transformPath(row['px'], row['py'], row['pz'], row['qw'], row['qx'], row['qy'], row['qz'])))
+        self.info = []        
+        
         # path is the list of positions
         self.path = []
         # self.trajectory = [np.eye(4)]
         xi = load_calibration_data(f'kalibr_imucam_chain.yaml')
         self.ImuToCam =  np.array(xi['cam0']['T_imu_cam']).reshape(4,4)
-        self.trajectory = [self.ground_truth[0][2] @ self.ImuToCam]
+        self.trajectory = [ground_truth[0][2] @ self.ImuToCam] # this should be np.eye(4)
         self.CamToIMU =  np.linalg.inv(self.ImuToCam)
     def set_info(self, info, side):
         if side == "left":
@@ -505,11 +517,11 @@ class EstimatePath(EstimatePose):
 
             _, R, t, mask = cv.recoverPose(E, inliers2, inliers1, mask=mask, cameraMatrix=self.K1)
             # print(f"Pre escalado: {t}")
-            baseline = self.ground_truth[i][1]
+            baseline = ground_truth[i][1]
             t = t * baseline
             T = np.vstack((np.hstack((R, t)), [0, 0, 0, 1]))
             self.trajectory.append(self.trajectory[i-1] @ np.linalg.inv(T))
-            # print(f"Post escalado: {t}, escala: {self.ground_truth[len(self.info)][1]}")
+            # print(f"Post escalado: {t}, escala: {ground_truth[len(self.info)][1]}")
             # xi_camera_i_to_next = np.vstack((np.hstack((R, t)), [0, 0, 0, 1]))
             # last_pose = self.path[-1][1].reshape(4,4)
             
@@ -527,19 +539,14 @@ class EstimatePath(EstimatePose):
         # x = [e[0][0] for e in self.path]
         # y = [e[0][1] for e in self.path]
         # z = [e[0][2] for e in self.path]
-        # gt = [e[2] for e in self.ground_truth] @ self.ImuToCam
+        # gt = [e[2] for e in ground_truth] @ self.ImuToCam
         # keep only the first half of ground truth poses (after transforming by ImuToCam)
-        gt_mats = [e[2] for e in self.ground_truth]
-        half_count = len(gt_mats) // 2
-        if half_count == 0:
-            # if there are less than 2 entries, keep all
-            gt = [mat @ self.ImuToCam for mat in gt_mats]
-        else:
-            gt = [mat @ self.ImuToCam for mat in gt_mats[:half_count]]
+        gt_mats = [e[2] for e in ground_truth]
+        
+        gt = [mat @ self.ImuToCam for mat in gt_mats[:len(self.trajectory)]]
         gxs = [e[:3,3][0] for e in gt]
         gys = [e[:3,3][1] for e in gt]
         gzs = [e[:3,3][2] for e in gt]
-        # times = [e[0] for e in self.ground_truth]
         ax.plot(x, y, z, c='red', label='Estimated Path', alpha=0.7, linewidth=0.75)
         sc2 = ax.plot(gxs, gys, gzs, c='blue', label='Ground Truth Path', alpha=0.7, linewidth=0.75)
         print("Initial Position GT: ", gxs[0], gys[0], gzs[0])
@@ -556,6 +563,8 @@ class EstimatePath(EstimatePose):
         plt.close()
 
 def main(args=None):
+    print("Loading ground truth data")
+    load_GT_data('ground_truth.csv')
     rclpy.init(args=args)
     executor = MultiThreadedExecutor()
     print("Starting bag player")
