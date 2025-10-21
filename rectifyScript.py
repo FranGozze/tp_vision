@@ -303,7 +303,6 @@ class  MappingPoints(Node):
         self.points_3d = []
 
     def set_info(self, points, header):
-        print(points)
         self.points_3d.append((points, header))
         self.compute()
 
@@ -325,8 +324,6 @@ class  MappingPoints(Node):
             world.append(points_world)                       
             self.publisher.publish(create_pointcloud2(np.array(points_world), header))        
         
-
-
 
 class DisparityMap(Node):
     def __init__(self, map_3d):
@@ -512,7 +509,6 @@ class ShowEstimatePoseLR(EstimatePose):
         self.calculated = True
 
 
-
 class EstimatePath(EstimatePose):
     def __init__(self):
         super().__init__(node_name='estimate_path')
@@ -524,7 +520,8 @@ class EstimatePath(EstimatePose):
         # self.trajectory = [np.eye(4)]
         xi = load_calibration_data(f'kalibr_imucam_chain.yaml')
         self.ImuToCam =  np.array(xi['cam0']['T_imu_cam']).reshape(4,4)
-        self.trajectory = [ground_truth[0][2] @ self.ImuToCam] # this should be np.eye(4)
+        self.ground_truth_camera = [gt[2] @ self.ImuToCam for gt in ground_truth]
+        self.trajectory = [self.ground_truth_camera[0]] # this should be np.eye(4)
         self.CamToIMU =  np.linalg.inv(self.ImuToCam)
     def set_info(self, info, side):
         if side == "left":
@@ -558,7 +555,8 @@ class EstimatePath(EstimatePose):
             baseline = ground_truth[i][1]
             t = t * baseline
             T = np.vstack((np.hstack((R, t)), [0, 0, 0, 1]))
-            self.trajectory.append(self.trajectory[i-1] @ np.linalg.inv(T))
+
+            self.trajectory.append(self.ground_truth_camera[i-1] @ T)
             # print(f"Post escalado: {t}, escala: {ground_truth[len(self.info)][1]}")
             # xi_camera_i_to_next = np.vstack((np.hstack((R, t)), [0, 0, 0, 1]))
             # last_pose = self.path[-1][1].reshape(4,4)
@@ -579,9 +577,9 @@ class EstimatePath(EstimatePose):
         # z = [e[0][2] for e in self.path]
         # gt = [e[2] for e in ground_truth] @ self.ImuToCam
         # keep only the first half of ground truth poses (after transforming by ImuToCam)
-        gt_mats = [e[2] for e in ground_truth]
+        # gt_mats = [e[2] for e in ground_truth]
         
-        gt = [mat @ self.ImuToCam for mat in gt_mats[:len(self.trajectory)]]
+        gt = self.ground_truth_camera[:len(self.trajectory)]
         gxs = [e[:3,3][0] for e in gt]
         gys = [e[:3,3][1] for e in gt]
         gzs = [e[:3,3][2] for e in gt]
