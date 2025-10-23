@@ -99,7 +99,8 @@ class ImageRectifier(Node):
             self.K1, self.D1, self.K2, self.D2, 
             self.image_size, self.R, self.T, flags=cv.CALIB_ZERO_DISPARITY, alpha=0
         )
-        map3d.setQ(self.Q)
+        if map3d is not None:
+            map3d.setQ(self.Q)
         # Precompute the undistortion and rectification maps
         self.map1x, self.map1y = cv.initUndistortRectifyMap(
             self.K1, self.D1, self.R1, self.P1, 
@@ -328,12 +329,11 @@ class  MappingPoints(Node):
         
 
 class DisparityMap(Node):
-    def __init__(self, map_3d):
+    def __init__(self):
         super().__init__('disparity_map')
         self.bridge = CvBridge()
         self.publisher = self.create_publisher(Image, '/stereo/disparity', 10)
         self.info = {}
-        self.map_3d = map_3d
         self.stereo = cv.StereoSGBM_create(
             minDisparity=0,
             numDisparities=16 * 5,
@@ -370,7 +370,6 @@ class DisparityMap(Node):
         self.compute(stamp_obj, msg.header)
 
     def publish(self, disp, header):
-        self.map_3d.set_info(disp, header)
         disp_msg = self.bridge.cv2_to_imgmsg(disp)
         disp_msg.header = header
         self.publisher.publish(disp_msg)
@@ -394,13 +393,18 @@ class Map3D(Node):
                                  [0, -1, 0],
                                  [1, 0, 0]])
         self.Q = None 
+        self.subscription_right = self.create_subscription(
+            Image,
+            f'/stereo/disparity',
+            self.callback, 10)
+    def callback(self,msg):
+        disparity = self.bridge.imgmsg_to_cv2(msg)
+        self.compute(disparity, msg.header)
 
     def setQ(self, Q):
         self.Q = Q
         
-    def set_info(self, disparity, header):
-        # return
-        self.compute(disparity, header)
+    
 
     def compute(self, disparity, header):
         if self.Q is not None:
@@ -408,7 +412,6 @@ class Map3D(Node):
             disparity = disparity.astype(np.float32) / 16.0
             # Reproyectar a 3D
             points_3d = cv.reprojectImageTo3D(disparity, self.Q)
-            
             
             # points_3d = points_3d.reshape(-1, 3)
             # valid_points = points_3d[~np.isnan(points_3d[:,2]) & ~np.isinf(points_3d[:,2]) & (points_3d[:,2] != 0)]
@@ -432,27 +435,29 @@ class Map3dDense(Map3D):
 
     def compute(self, disparity, header):
         if self.Q is not None:
+            if self.frame % 5 == 0:
             # Reescalar la disparidad
-            disparity = disparity.astype(np.float32) / 16.0
-            # Reproyectar a 3D
-            points_3d = cv.reprojectImageTo3D(disparity, self.Q)
-            mask = disparity > disparity.min()
-            points_3d = points_3d[mask]
-            points_3d = points_3d[ ~np.isnan(points_3d[:,2]) & ~np.isinf(points_3d[:,2]) & (points_3d[:,2] != 0)]
-            points_3d = points_3d.reshape(-1, 3)
-            gt_transform = ground_truth[self.frame][2]
-            R = gt_transform[:3, :3]
-            t = gt_transform[:3, 3].reshape(3, 1)
-            world_points = []
-            for point in points_3d:
-                newPoint = R @ point.T
-                newPoint[0] += t[0]
-                newPoint[1] += t[1]
-                newPoint[2] += t[2]                
-                world_points.append(newPoint / 1000)
-            # all_points = np.vstack(self.accumulated_points)
-            msg = create_pointcloud2(np.array(world_points), header)
-            self.publisher.publish(msg)      
+                disparity = disparity.astype(np.float32) / 16.0
+                # Reproyectar a 3D
+                points_3d = cv.reprojectImageTo3D(disparity, self.Q)
+                mask = disparity > disparity.min()
+                points_3d = points_3d[mask]
+                points_3d = points_3d[ ~np.isnan(points_3d[:,2]) & ~np.isinf(points_3d[:,2]) & (points_3d[:,2] != 0)]
+                points_3d = points_3d.reshape(-1, 3)
+                gt_transform = ground_truth[self.frame][2]
+                R = gt_transform[:3, :3]
+                t = gt_transform[:3, 3].reshape(3, 1)
+                world_points = []
+                for index in range(0,len(points_3d),50):                
+                    point = points_3d[index]
+                    newPoint = R @ point.T
+                    newPoint[0] += t[0]
+                    newPoint[1] += t[1]
+                    newPoint[2] += t[2]                
+                    world_points.append(newPoint / 1000)
+                # all_points = np.vstack(self.accumulated_points)
+                msg = create_pointcloud2(np.array(world_points), header)
+                self.publisher.publish(msg)      
         self.frame += 1 
 
 class EstimatePose(Node):
@@ -478,6 +483,7 @@ class EstimatePose(Node):
             self.info[stamp_obj] = {}
         self.info[stamp_obj][side] = info
         self.compute(stamp_obj)
+        
     def compute(self, stamp):
         if not self.calculated:
             if stamp in self.info and "left" in self.info[stamp] and "right" in self.info[stamp]:
@@ -489,8 +495,8 @@ class EstimatePose(Node):
                 point1 = np.float32([left['keypoints'][m.queryIdx].pt for m in matches])
                 point2 =  np.float32([right['keypoints'][m.trainIdx].pt for m in matches])
 
-                E, mask = cv.findEssentialMat(  point1, 
-                                                point2,
+                E, mask = cv.findEssentialMat(  point2, 
+                                                point1,
                                                 self.K1,
                                                 method=cv.RANSAC, 
                                                 prob=0.999, 
@@ -499,12 +505,14 @@ class EstimatePose(Node):
                 inliers1 = point1[mask]
                 inliers2 = point2[mask]
 
-                _, R, t, mask = cv.recoverPose(E, inliers1, inliers2, mask=mask, cameraMatrix=self.K1)
+                _, R, t, mask = cv.recoverPose(E, inliers2, inliers1, mask=mask, cameraMatrix=self.K1)
 
                 t = t * self.baseline                
                 self.t = t
     def show(self, R, t):
         pass
+
+
 class ShowEstimatePoseLR(EstimatePose):
     def __init__(self):
         super().__init__(node_name='show_estimate_pose_lr')
@@ -639,14 +647,14 @@ def main(args=None):
     bag_player = BagPlayer()
     executor.add_node(bag_player)
     print("Starting 3D mapper")
-    # map3d = Map3D()
-    map3d = Map3dDense()
+    map3d = Map3D()
+    # map3d = Map3dDense()
     # executor.add_node(map3d)
     print("Starting image rectifier")
     rectifier = ImageRectifier(map3d)
     executor.add_node(rectifier)
     print("Starting image disparity")
-    dispMap = DisparityMap(map3d)
+    dispMap = DisparityMap()
     executor.add_node(dispMap)
     print("Starting mapping points from triangulation")
     mappingPoints = MappingPoints()
@@ -673,6 +681,8 @@ def main(args=None):
         pass
     finally:
         executor.shutdown()
+        estimator.show()
+        pathEstimator.compute()        
         bag_player.destroy_node()
         rectifier.destroy_node()
         map3d.destroy_node()
@@ -681,8 +691,7 @@ def main(args=None):
         keyDetectorR.destroy_node()
         matcher.destroy_node()
         triangulation.destroy_node()
-        estimator.show()
-        pathEstimator.compute()
+        estimator.destroy_node()
         pathEstimator.destroy_node()
         rclpy.shutdown()
 
