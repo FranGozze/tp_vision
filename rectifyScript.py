@@ -21,7 +21,7 @@ def load_calibration_data(file_path):
         calib_data = yaml.safe_load(file)
     return calib_data
 
-ground_truth = []
+ground_truth_camera = []
 
 def get_distance(lastPoint, newPoint):
     distance = np.sqrt((lastPoint[0] - newPoint[0])**2 + (lastPoint[1] - newPoint[1])**2 + (lastPoint[2] - newPoint[2])**2)
@@ -38,16 +38,19 @@ def transformPath(x,y,z,qw,qx,qy,qz):
 
 def load_GT_data(file_path='ground_truth.csv'):
     df = pd.read_csv(file_path, header=0)
+    xi = load_calibration_data(f'kalibr_imucam_chain.yaml')
+    ImuToCam =  np.array(xi['cam0']['T_imu_cam']).reshape(4,4)
     for index, row in df.iterrows():
         newPoint = np.array([row['px'], row['py'], row['pz']])
         if index == 0:
             lastPoint = newPoint
         else:
-            lastPoint = ground_truth[-1][0]
+            lastPoint = ground_truth_camera[-1][0]
         distance = get_distance(lastPoint, newPoint)
-        ground_truth.append((newPoint, distance,transformPath(row['px'], row['py'], row['pz'], row['qw'], row['qx'], row['qy'], row['qz'])))
+        transform = transformPath(row['px'], row['py'], row['pz'], row['qw'], row['qx'], row['qy'], row['qz'])
+        transform = ImuToCam @ transform  # Transformar de IMU a cámara
+        ground_truth_camera.append((newPoint, distance,transform))
     
-
 class BagPlayer(Node):
     def __init__(self):
         super().__init__('bag_player')
@@ -151,6 +154,7 @@ class Matcher(Node):
         self.bridge = CvBridge()
         self.bf = cv.BFMatcher(cv.NORM_HAMMING, crossCheck=True)
         self.publisher = self.create_publisher(Image, '/stereo/matched_keypoints', 10)
+        self.publisherFiltered = self.create_publisher(Image, '/stereo/filtered_matched_keypoints', 10)
         self.info = {}
         self.triangulation = triangulation
         
@@ -173,13 +177,22 @@ class Matcher(Node):
             matched_image = cv.drawMatches(
                 left['image'], left['keypoints'],
                 right['image'], right['keypoints'],
-                matches[:10], None, flags=cv.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+                matches, None, flags=cv.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
             )
             match_msg = self.bridge.cv2_to_imgmsg(matched_image, encoding='bgr8')
             match_msg.header = left['header']
             match_msg.header.frame_id = "matched_keypoints"
             self.publisher.publish(match_msg)
-            # Reset images after processing
+            filtered_matches = filter(lambda m: m.distance < 30, matches)
+            filtered_image = cv.drawMatches(
+                left['image'], left['keypoints'],
+                right['image'], right['keypoints'],
+                list(filtered_matches), None, flags=cv.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+            )
+            filtered_msg = self.bridge.cv2_to_imgmsg(filtered_image, encoding='bgr8')
+            filtered_msg.header = left['header']
+            filtered_msg.header.frame_id = "filtered_matched_keypoints"
+            self.publisherFiltered.publish(filtered_msg)
             # cv.imshow("Matched Keypoints", matched_image)
             # cv.waitKey(1)
             
@@ -245,7 +258,7 @@ class TriangulatePoints(Node):
     def __init__(self, node_name='triangulate_points', map=None):
         super().__init__(node_name)
         self.bridge = CvBridge()
-        self.publisher = self.create_publisher(PointCloud2, '/stereo/triangulated_points', 10)
+        self.publisher = self.create_publisher(PointCloud2, f'/stereo/{node_name}', 10)
         calib_data_left = load_calibration_data(f'calibrationdata/left.yaml')
         calib_data_right = load_calibration_data(f'calibrationdata/right.yaml')
         projection_left = np.array(calib_data_left['projection_matrix']['data']).reshape(3, 4)
@@ -296,7 +309,7 @@ class TriangulatedPointsRansac(TriangulatePoints):
 
         self.publish(triangulatedPoints, left_info['header'])
 
-
+# Clase para mapear los puntos de triangulacion al sistema de coordenadas mundial
 class  MappingPoints(Node):
     def __init__(self, node_name='mapping_points'):
         super().__init__(node_name)
@@ -310,11 +323,8 @@ class  MappingPoints(Node):
 
     def compute(self, points, header):
         world = []
-        # for index in range(min(len(self.points_3d), len(ground_truth))):
-            # points = self.points_3d[index][0]
-            # header = self.points_3d[index][1]
         
-        gt_transform = ground_truth[len(self.points_3d)][2]
+        gt_transform = ground_truth_camera[len(self.points_3d)][2]
         points_world = []
         R = gt_transform[:3, :3]
         t = gt_transform[:3, 3].reshape(3, 1)
@@ -382,7 +392,7 @@ class DisparityMap(Node):
             # disp_normalized = cv.normalize(disparity_map,None,255,0,cv.NORM_MINMAX, cv.CV_8U)
             self.publish(disparity_map, header)
 
-
+# Clase para mapear las proyecciones del mapa de disparidad a 3D (Sin moverse)
 class Map3D(Node):
     def __init__(self, node_name='map_3d'):
         super().__init__(node_name)
@@ -393,7 +403,7 @@ class Map3D(Node):
                                  [0, -1, 0],
                                  [1, 0, 0]])
         self.Q = None 
-        self.subscription_right = self.create_subscription(
+        self.subscription = self.create_subscription(
             Image,
             f'/stereo/disparity',
             self.callback, 10)
@@ -404,29 +414,20 @@ class Map3D(Node):
     def setQ(self, Q):
         self.Q = Q
         
-    
-
     def compute(self, disparity, header):
         if self.Q is not None:
             # Reescalar la disparidad
             disparity = disparity.astype(np.float32) / 16.0
             # Reproyectar a 3D
             points_3d = cv.reprojectImageTo3D(disparity, self.Q)
-            
-            # points_3d = points_3d.reshape(-1, 3)
-            # valid_points = points_3d[~np.isnan(points_3d[:,2]) & ~np.isinf(points_3d[:,2]) & (points_3d[:,2] != 0)]
-            # print(f"Number of valid 3D points: {len(valid_points)}")
             mask = disparity > disparity.min()
             points_3d = points_3d[mask]
-            points_3d = points_3d[ ~np.isnan(points_3d[:,2]) & ~np.isinf(points_3d[:,2]) & (points_3d[:,2] != 0)]
-            # print(f"Number of valid 3D points after filtering: {len(points_3d)}")
-            # print(points_3d)
-            # Aplicar la rotación para corregir la orientación
+            points_3d = points_3d[ ~np.isnan(points_3d[:,2]) & ~np.isinf(points_3d[:,2]) & (points_3d[:,2] != 0)]            
             points_3d = points_3d.reshape(-1, 3)
 
             msg = create_pointcloud2(points_3d[:] / 1000, header)
             self.publisher.publish(msg)
-
+# Clase para mapear las proyecciones del mapa de disparidad a 3D teniendo en cuenta el ground truth
 class Map3dDense(Map3D):
     def __init__(self):
         super().__init__('map_3d_dense')
@@ -444,7 +445,7 @@ class Map3dDense(Map3D):
                 points_3d = points_3d[mask]
                 points_3d = points_3d[ ~np.isnan(points_3d[:,2]) & ~np.isinf(points_3d[:,2]) & (points_3d[:,2] != 0)]
                 points_3d = points_3d.reshape(-1, 3)
-                gt_transform = ground_truth[self.frame][2]
+                gt_transform = ground_truth_camera[self.frame][2]
                 R = gt_transform[:3, :3]
                 t = gt_transform[:3, 3].reshape(3, 1)
                 world_points = []
@@ -519,31 +520,45 @@ class ShowEstimatePoseLR(EstimatePose):
     def show(self, R = None, t = None):  
         # Plot origin and translation vector t in 3D
         try:
-          origin = np.zeros(3)
-          tvec = np.asarray(self.t).ravel()
+            origin = np.zeros(3)
+            tvec = np.asarray(self.t).ravel()
 
-          fig = plt.figure(figsize=(6,6))
-          ax = fig.add_subplot(111, projection='3d')
-          ax.scatter(*origin, color='red', s=50, label='origin (0,0,0)')
-          ax.scatter(tvec[0], tvec[1], tvec[2], color='blue', s=50, label='t')
-          ax.plot([0, tvec[0]], [0, tvec[1]], [0, tvec[2]], color='gray', linestyle='--')
+            fig = plt.figure(figsize=(6,6))
+            ax = fig.add_subplot(111, projection='3d')
+        # Draw axis arrows from origin
+            scale = np.linalg.norm(tvec)
+            if scale == 0:
+                scale = 1.0
+            axis_len = scale * 0.6
+            ax.quiver(0, 0, 0, axis_len, 0, 0, color='r', arrow_length_ratio=0.1, linewidth=1.5)
+            ax.quiver(0, 0, 0, 0, axis_len, 0, color='b', arrow_length_ratio=0.1, linewidth=1.5)
+            ax.quiver(0, 0, 0, 0, 0, -axis_len, color='g', arrow_length_ratio=0.1, linewidth=1.5)
+            # ax.quiver(0, 0, 0, axis_len, 0, 0, color='r', arrow_length_ratio=0.1, linewidth=1.5)
+            # ax.quiver(0, 0, 0, 0, 0, axis_len, color='g', arrow_length_ratio=0.1, linewidth=1.5)
+            # ax.quiver(0, 0, 0, axis_len, 0, 0,  color='b', arrow_length_ratio=0.1, linewidth=1.5)
+            ax.text(axis_len, 0, 0, 'X', color='r')
+            ax.text(0, axis_len, 0, 'Z', color='b')
+            ax.text(0, 0, -axis_len, 'Y', color='g')
+            ax.scatter(*origin, color='red', s=50, label='Left Camera (Origin)')          
+            ax.scatter(tvec[0], tvec[1], tvec[2], color='blue', s=50, label='Right Camera')
+            ax.plot([0, tvec[0]], [0, tvec[1]], [0, tvec[2]], color='gray', linestyle='--')
 
-          # Set equal scaling
-          pts = np.vstack((origin, tvec))
-          max_range = np.max(np.ptp(pts, axis=0))
-          if max_range == 0:
-            max_range = 1.0
-          mid = np.mean(pts, axis=0)
-          ax.set_xlim(mid[0] - max_range/2, mid[0] + max_range/2)
-          ax.set_ylim(mid[1] - max_range/2, mid[1] + max_range/2)
-          ax.set_zlim(mid[2] - max_range/2, mid[2] + max_range/2)
+            # Set equal scaling
+            pts = np.vstack((origin, tvec))
+            max_range = np.max(np.ptp(pts, axis=0))
+            if max_range == 0:
+                max_range = 1.0
+            mid = np.mean(pts, axis=0)
+            ax.set_xlim((mid[0] - max_range/2)*2, (mid[0] + max_range/2)*2)
+            ax.set_ylim((mid[1] - max_range/2)*2, (mid[1] + max_range/2)*2)
+            ax.set_zlim((mid[2] - max_range/2)*2, (mid[2] + max_range/2)*2)
 
-          ax.set_xlabel('X (m)')
-          ax.set_ylabel('Y (m)')
-          ax.set_zlabel('Z (m)')
-          ax.legend()
-          plt.savefig('pose_estimation.png')
-          plt.close()
+            # ax.set_xlabel('X (m)')
+            # ax.set_ylabel('Y (m)')
+            # ax.set_zlabel('Z (m)')
+            ax.legend()
+            plt.savefig('pose_estimation.png')
+            plt.close()
         except Exception as e:
           print("Could not plot 3D points:", e)
         self.calculated = True
@@ -558,11 +573,9 @@ class EstimatePath(EstimatePose):
         # path is the list of positions
         self.path = []
         # self.trajectory = [np.eye(4)]
-        xi = load_calibration_data(f'kalibr_imucam_chain.yaml')
-        self.ImuToCam =  np.array(xi['cam0']['T_imu_cam']).reshape(4,4)
-        self.ground_truth_camera = [gt[2] @ self.ImuToCam for gt in ground_truth]
-        self.trajectory = [self.ground_truth_camera[0]] # this should be np.eye(4)
-        self.CamToIMU =  np.linalg.inv(self.ImuToCam)
+        
+        self.trajectory = [ground_truth_camera[0][2]] # this should be np.eye(4)
+        
     def set_info(self, info, side):
         if side == "left":
             self.info.append(info)
@@ -592,11 +605,11 @@ class EstimatePath(EstimatePose):
 
             _, R, t, mask = cv.recoverPose(E, inliers2, inliers1, mask=mask, cameraMatrix=self.K1)
             # print(f"Pre escalado: {t}")
-            baseline = ground_truth[i][1]
+            baseline = ground_truth_camera[i][1]
             t = t * baseline
             T = np.vstack((np.hstack((R, t)), [0, 0, 0, 1]))
 
-            self.trajectory.append(self.ground_truth_camera[i-1] @ T)
+            self.trajectory.append(ground_truth_camera[i-1][2] @ T)
             # print(f"Post escalado: {t}, escala: {ground_truth[len(self.info)][1]}")
             # xi_camera_i_to_next = np.vstack((np.hstack((R, t)), [0, 0, 0, 1]))
             # last_pose = self.path[-1][1].reshape(4,4)
@@ -619,10 +632,10 @@ class EstimatePath(EstimatePose):
         # keep only the first half of ground truth poses (after transforming by ImuToCam)
         # gt_mats = [e[2] for e in ground_truth]
         
-        gt = self.ground_truth_camera[:len(self.trajectory)]
-        gxs = [e[:3,3][0] for e in gt]
-        gys = [e[:3,3][1] for e in gt]
-        gzs = [e[:3,3][2] for e in gt]
+        gt = ground_truth_camera[:len(self.trajectory)]
+        gxs = [e[2][:3,3][0] for e in gt]
+        gys = [e[2][:3,3][1] for e in gt]
+        gzs = [e[2][:3,3][2] for e in gt]
         ax.plot(x, y, z, c='red', label='Estimated Path', alpha=0.7, linewidth=0.75)
         sc2 = ax.plot(gxs, gys, gzs, c='blue', label='Ground Truth Path', alpha=0.7, linewidth=0.75)
         print("Initial Position GT: ", gxs[0], gys[0], gzs[0])
@@ -649,7 +662,7 @@ def main(args=None):
     print("Starting 3D mapper")
     map3d = Map3D()
     # map3d = Map3dDense()
-    # executor.add_node(map3d)
+    executor.add_node(map3d)
     print("Starting image rectifier")
     rectifier = ImageRectifier(map3d)
     executor.add_node(rectifier)
