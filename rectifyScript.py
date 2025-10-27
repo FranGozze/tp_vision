@@ -16,7 +16,7 @@ import struct
 from std_msgs.msg import Header
 import time
 
-def load_calibration_data(file_path):
+def load_yaml(file_path):
     with open(file_path, 'r') as file:
         calib_data = yaml.safe_load(file)
     return calib_data
@@ -32,13 +32,13 @@ def transformPath(x,y,z,qw,qx,qy,qz):
     translation = np.array([x, y, z]).reshape((3, 1))
     # Creamos la matriz de rototraslacion
     transform = np.vstack((np.hstack((rotation, translation)), [0, 0, 0, 1]))
-    # Suponiendo que timestamp esta en ticks pasamos a segundos
+    
 
     return transform
 
 def load_GT_data(file_path='ground_truth.csv'):
     df = pd.read_csv(file_path, header=0)
-    xi = load_calibration_data(f'kalibr_imucam_chain.yaml')
+    xi = load_yaml(f'kalibr_imucam_chain.yaml')
     ImuToCam =  np.array(xi['cam0']['T_imu_cam']).reshape(4,4)
     for index, row in df.iterrows():
         newPoint = np.array([row['px'], row['py'], row['pz']])
@@ -48,9 +48,10 @@ def load_GT_data(file_path='ground_truth.csv'):
             lastPoint = ground_truth_camera[-1][0]
         distance = get_distance(lastPoint, newPoint)
         transform = transformPath(row['px'], row['py'], row['pz'], row['qw'], row['qx'], row['qy'], row['qz'])
-        transform = ImuToCam @ transform  # Transformar de IMU a cámara
+        transform = ImuToCam @ transform  
         ground_truth_camera.append((newPoint, distance,transform))
-    
+
+#   Clase para reproducir el bag file y remapear los topics
 class BagPlayer(Node):
     def __init__(self):
         super().__init__('bag_player')
@@ -69,6 +70,9 @@ class BagPlayer(Node):
         self.timer = self.create_timer(0.1, self.timer_callback)
   
     def timer_callback(self):
+        if not self.reader.has_next():
+            raise KeyboardInterrupt
+            return
         while self.reader.has_next():
             (topic, raw_data, stamp) = self.reader.read_next()
             if topic in self.remap_topics.keys():    
@@ -76,16 +80,16 @@ class BagPlayer(Node):
                 break  # Publicar solo un mensaje por llamada al timer
             else:
                 continue
-        raise KeyboardInterrupt
+        
 
-
+#  Esta clase es para el ejercio 2-a: Rectificacion de imagenes
 class ImageRectifier(Node):
     def __init__(self, map3d):
         super().__init__('image_rectifier')
         self.bridge = CvBridge()
         # Load calibration data
-        calib_data_left = load_calibration_data(f'calibrationdata/left.yaml')
-        calib_data_right = load_calibration_data(f'calibrationdata/right.yaml')
+        calib_data_left = load_yaml(f'calibrationdata/left.yaml')
+        calib_data_right = load_yaml(f'calibrationdata/right.yaml')
         
         self.K1 = np.array(calib_data_left['camera_matrix']['data']).reshape(3, 3)
         self.D1 = np.array(calib_data_left['distortion_coefficients']['data'])
@@ -147,7 +151,7 @@ class ImageRectifier(Node):
         rect_msg.header = msg.header
         self.pub_right_rect.publish(rect_msg)
 
-
+#  Esta clase es para el ejercio 2-c: Match de keypoints 
 class Matcher(Node):
     def __init__(self, triangulation):
         super().__init__('matcher')
@@ -196,7 +200,7 @@ class Matcher(Node):
             # cv.imshow("Matched Keypoints", matched_image)
             # cv.waitKey(1)
             
-
+#  Esta clase es para el ejercio 2-b: Extraccion de keypoints
 class KeypointDetector(Node):
     def __init__(self, side, dependencies, node_name='keypoint_detector'):
         super().__init__(node_name)
@@ -253,14 +257,14 @@ def create_pointcloud2(points, header):
     msg.is_dense = False
     return msg
 
-
+#  Esta clase es para el ejercio 2-d: Triangulacion de puntos
 class TriangulatePoints(Node):
     def __init__(self, node_name='triangulate_points', map=None):
         super().__init__(node_name)
         self.bridge = CvBridge()
         self.publisher = self.create_publisher(PointCloud2, f'/stereo/{node_name}', 10)
-        calib_data_left = load_calibration_data(f'calibrationdata/left.yaml')
-        calib_data_right = load_calibration_data(f'calibrationdata/right.yaml')
+        calib_data_left = load_yaml(f'calibrationdata/left.yaml')
+        calib_data_right = load_yaml(f'calibrationdata/right.yaml')
         projection_left = np.array(calib_data_left['projection_matrix']['data']).reshape(3, 4)
         projection_right = np.array(calib_data_right['projection_matrix']['data']).reshape(3, 4)
         self.projections = np.array([projection_left, projection_right])
@@ -282,7 +286,7 @@ class TriangulatePoints(Node):
         
         # Publicar los puntos 3D como PointCloud2
 
-
+#  Esta clase es para el ejercio 2-e: Triangulacion de puntos con RANSAC
 class TriangulatedPointsRansac(TriangulatePoints):
     def __init__(self, node_name='triangulated_points_ransac', map=None):
         super().__init__(node_name, map)
@@ -309,7 +313,7 @@ class TriangulatedPointsRansac(TriangulatePoints):
 
         self.publish(triangulatedPoints, left_info['header'])
 
-# Clase para mapear los puntos de triangulacion al sistema de coordenadas mundial
+#  Esta clase es para el ejercio 2-f: Mapeo de Features triangulados al sistema de coordenadas mundial
 class  MappingPoints(Node):
     def __init__(self, node_name='mapping_points'):
         super().__init__(node_name)
@@ -337,7 +341,7 @@ class  MappingPoints(Node):
             points_world.append(newPoint)
         self.publisher.publish(create_pointcloud2(np.array(points_world), header))
         
-
+#  Esta clase es para el ejercio 2-g: Calculo del mapa de disparidad
 class DisparityMap(Node):
     def __init__(self):
         super().__init__('disparity_map')
@@ -392,7 +396,7 @@ class DisparityMap(Node):
             # disp_normalized = cv.normalize(disparity_map,None,255,0,cv.NORM_MINMAX, cv.CV_8U)
             self.publish(disparity_map, header)
 
-# Clase para mapear las proyecciones del mapa de disparidad a 3D (Sin moverse)
+#  Esta clase es para el ejercio 2-h: Reconstruccion densa a partir del mapa de disparidad
 class Map3D(Node):
     def __init__(self, node_name='map_3d'):
         super().__init__(node_name)
@@ -427,7 +431,9 @@ class Map3D(Node):
 
             msg = create_pointcloud2(points_3d[:] / 1000, header)
             self.publisher.publish(msg)
-# Clase para mapear las proyecciones del mapa de disparidad a 3D teniendo en cuenta el ground truth
+
+#  Esta clase es para el ejercio 2-i: Reconstruccion densa con ground truth
+# Debido a que por cada frame se generan muchos puntos 3D, solo se publican 1 de cada 50 puntos
 class Map3dDense(Map3D):
     def __init__(self):
         super().__init__('map_3d_dense')
@@ -461,6 +467,7 @@ class Map3dDense(Map3D):
                 self.publisher.publish(msg)      
         self.frame += 1 
 
+# Clase base para la estimacion de pose
 class EstimatePose(Node):
     def __init__(self, node_name='estimate_pose'):
         super().__init__(node_name)
@@ -468,15 +475,29 @@ class EstimatePose(Node):
         self.bf = cv.BFMatcher(cv.NORM_HAMMING, crossCheck=True)
         self.calculated = False
         self.info = {}
-        calib_data_left = load_calibration_data(f'calibrationdata/left.yaml')
-        calib_data_right = load_calibration_data(f'calibrationdata/right.yaml')
+        calib_data_left = load_yaml(f'calibrationdata/left.yaml')
+        calib_data_right = load_yaml(f'calibrationdata/right.yaml')
         
         self.K1 = np.array(calib_data_left['camera_matrix']['data']).reshape(3, 3)
         self.K2 = np.array(calib_data_right['camera_matrix']['data']).reshape(3, 3)
         self.t = None
         self.baseline = abs(calib_data_right['projection_matrix']['data'][3]) / 1000  # Convertir a metros
-        print("Baseline (m): ", self.baseline)
         
+
+    def set_info(self, info, side):
+        pass
+
+    def compute(self):
+        pass
+
+    def show(self, R, t):
+        pass
+
+#  Esta clase es para el ejercio 2-j-1: Estimacion de pose entre dos camaras
+class ShowEstimatePoseLR(EstimatePose):
+    def __init__(self):
+        super().__init__(node_name='show_estimate_pose_lr')
+        print("Baseline (m): ", self.baseline)
     def set_info(self, info, side):
         stamp = info['header'].stamp
         stamp_obj = (stamp.sec, stamp.nanosec)
@@ -510,13 +531,6 @@ class EstimatePose(Node):
 
                 t = t * self.baseline                
                 self.t = t
-    def show(self, R, t):
-        pass
-
-
-class ShowEstimatePoseLR(EstimatePose):
-    def __init__(self):
-        super().__init__(node_name='show_estimate_pose_lr')
     def show(self, R = None, t = None):  
         # Plot origin and translation vector t in 3D
         try:
@@ -533,9 +547,6 @@ class ShowEstimatePoseLR(EstimatePose):
             ax.quiver(0, 0, 0, axis_len, 0, 0, color='r', arrow_length_ratio=0.1, linewidth=1.5)
             ax.quiver(0, 0, 0, 0, axis_len, 0, color='b', arrow_length_ratio=0.1, linewidth=1.5)
             ax.quiver(0, 0, 0, 0, 0, -axis_len, color='g', arrow_length_ratio=0.1, linewidth=1.5)
-            # ax.quiver(0, 0, 0, axis_len, 0, 0, color='r', arrow_length_ratio=0.1, linewidth=1.5)
-            # ax.quiver(0, 0, 0, 0, 0, axis_len, color='g', arrow_length_ratio=0.1, linewidth=1.5)
-            # ax.quiver(0, 0, 0, axis_len, 0, 0,  color='b', arrow_length_ratio=0.1, linewidth=1.5)
             ax.text(axis_len, 0, 0, 'X', color='r')
             ax.text(0, axis_len, 0, 'Z', color='b')
             ax.text(0, 0, -axis_len, 'Y', color='g')
@@ -552,10 +563,7 @@ class ShowEstimatePoseLR(EstimatePose):
             ax.set_xlim((mid[0] - max_range/2)*2, (mid[0] + max_range/2)*2)
             ax.set_ylim((mid[1] - max_range/2)*2, (mid[1] + max_range/2)*2)
             ax.set_zlim((mid[2] - max_range/2)*2, (mid[2] + max_range/2)*2)
-
-            # ax.set_xlabel('X (m)')
-            # ax.set_ylabel('Y (m)')
-            # ax.set_zlabel('Z (m)')
+            
             ax.legend()
             plt.savefig('pose_estimation.png')
             plt.close()
@@ -563,7 +571,7 @@ class ShowEstimatePoseLR(EstimatePose):
           print("Could not plot 3D points:", e)
         self.calculated = True
 
-
+#  Esta clase es para el ejercio 2-j-2: Estimacion de camino realizado por la camara izquierda
 class EstimatePath(EstimatePose):
     def __init__(self):
         super().__init__(node_name='estimate_path')
@@ -660,8 +668,8 @@ def main(args=None):
     bag_player = BagPlayer()
     executor.add_node(bag_player)
     print("Starting 3D mapper")
-    map3d = Map3D()
-    # map3d = Map3dDense()
+    # map3d = Map3D()
+    map3d = Map3dDense()
     executor.add_node(map3d)
     print("Starting image rectifier")
     rectifier = ImageRectifier(map3d)
@@ -681,8 +689,7 @@ def main(args=None):
     executor.add_node(matcher)
     print("Starting pose estimator")
     estimator = ShowEstimatePoseLR()
-    pathEstimator = EstimatePath()
-    # executor.add_node(estimator)
+    pathEstimator = EstimatePath()    
     print("Starting keypoint detector")
     keyDetectorL = KeypointDetector("left", [matcher, estimator, pathEstimator], node_name='keypoint_detector_left')
     keyDetectorR = KeypointDetector("right", [matcher, estimator], node_name='keypoint_detector_right')
