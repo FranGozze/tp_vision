@@ -319,28 +319,28 @@ class  MappingPoints(Node):
         super().__init__(node_name)
         self.bridge = CvBridge()
         self.publisher = self.create_publisher(PointCloud2, '/stereo/mapped_triangulated_points', 10)
-        self.points_3d = []
+        self.publisher_persistent = self.create_publisher(PointCloud2, '/stereo/mapped_triangulated_points_persistent', 10)
+        self.frame = 0
+        self.accumulated_points = []
 
     def set_info(self, points, header):
-        self.points_3d.append((points, header))
         self.compute(points,header)
 
-    def compute(self, points, header):
-        world = []
+    def compute(self, points, header):        
         
-        gt_transform = ground_truth_camera[len(self.points_3d)][2]
+        gt_transform = ground_truth_camera[self.frame][2]
         points_world = []
         R = gt_transform[:3, :3]
-        t = gt_transform[:3, 3].reshape(3, 1)
+        t = gt_transform[:3, 3].reshape(1, 3)
         for point in points:
-            newPoint = R @ point.T
-            newPoint[0] += t[0]
-            newPoint[1] += t[1]
-            newPoint[2] += t[2]                
-            # world.append(newPoint)
+            newPoint = (R @ point.T) + t.ravel()             
             points_world.append(newPoint)
         self.publisher.publish(create_pointcloud2(np.array(points_world), header))
-        
+
+        self.accumulated_points.extend(points_world)
+        persistent_msg = create_pointcloud2(np.array(self.accumulated_points), header)
+        self.publisher_persistent.publish(persistent_msg)
+        self.frame += 1
 #  Esta clase es para el ejercio 2-g: Calculo del mapa de disparidad
 class DisparityMap(Node):
     def __init__(self):
@@ -435,8 +435,9 @@ class Map3D(Node):
 #  Esta clase es para el ejercio 2-i: Reconstruccion densa con ground truth
 # Debido a que por cada frame se generan muchos puntos 3D, solo se publican 1 de cada 50 puntos
 class Map3dDense(Map3D):
-    def __init__(self):
-        super().__init__('map_3d_dense')
+    def __init__(self, node_name='map_3d_dense'):
+        super().__init__(node_name)
+        self.publisher_persistent = self.create_publisher(PointCloud2, f'/stereo/{node_name}_persistent', 10)
         self.frame = 0
         self.accumulated_points = []
 
@@ -453,18 +454,17 @@ class Map3dDense(Map3D):
                 points_3d = points_3d.reshape(-1, 3)
                 gt_transform = ground_truth_camera[self.frame][2]
                 R = gt_transform[:3, :3]
-                t = gt_transform[:3, 3].reshape(3, 1)
+                t = gt_transform[:3, 3].reshape(1, 3)
                 world_points = []
                 for index in range(0,len(points_3d),50):                
                     point = points_3d[index]
-                    newPoint = R @ point.T
-                    newPoint[0] += t[0]
-                    newPoint[1] += t[1]
-                    newPoint[2] += t[2]                
+                    newPoint = (R @ point.T) + t.ravel()
                     world_points.append(newPoint / 1000)
-                # all_points = np.vstack(self.accumulated_points)
                 msg = create_pointcloud2(np.array(world_points), header)
-                self.publisher.publish(msg)      
+                self.publisher.publish(msg)
+                self.accumulated_points.extend(world_points)
+                persistent_msg = create_pointcloud2(np.array(self.accumulated_points), header)
+                self.publisher_persistent.publish(persistent_msg)      
         self.frame += 1 
 
 # Clase base para la estimacion de pose
