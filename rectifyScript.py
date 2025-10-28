@@ -3,7 +3,6 @@ import numpy as np
 from matplotlib import pyplot as plt
 import yaml
 import pandas as pd
-import sys
 import rclpy
 import transforms3d
 from rclpy.node import Node
@@ -11,10 +10,9 @@ from sensor_msgs.msg import Image, PointCloud2, PointField
 from cv_bridge import CvBridge
 from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
 from rclpy.executors import MultiThreadedExecutor
-from datetime import datetime as time
 import struct
-from std_msgs.msg import Header
-import time
+import argparse
+
 
 def load_yaml(file_path):
     with open(file_path, 'r') as file:
@@ -23,18 +21,21 @@ def load_yaml(file_path):
 
 ground_truth_camera = []
 
+
 def get_distance(lastPoint, newPoint):
     distance = np.sqrt((lastPoint[0] - newPoint[0])**2 + (lastPoint[1] - newPoint[1])**2 + (lastPoint[2] - newPoint[2])**2)
     return  distance
 
+
 def transformPath(x,y,z,qw,qx,qy,qz):
     rotation = transforms3d.quaternions.quat2mat([qw, qx, qy, qz])
     translation = np.array([x, y, z]).reshape((3, 1))
+
     # Creamos la matriz de rototraslacion
     transform = np.vstack((np.hstack((rotation, translation)), [0, 0, 0, 1]))
     
-
     return transform
+
 
 def load_GT_data(file_path='ground_truth.csv'):
     df = pd.read_csv(file_path, header=0)
@@ -51,6 +52,7 @@ def load_GT_data(file_path='ground_truth.csv'):
         transform = ImuToCam @ transform  
         ground_truth_camera.append((newPoint, distance,transform))
 
+        
 #   Clase para reproducir el bag file y remapear los topics
 class BagPlayer(Node):
     def __init__(self):
@@ -61,7 +63,7 @@ class BagPlayer(Node):
             self.reader.open(StorageOptions(uri='V1_01_easy'), ConverterOptions( input_serialization_format='cdr', output_serialization_format='cdr'))
         except Exception as e:
             self.get_logger().error(f'Failed to open bag file: {e}')
-            # rclpy.shutdown()
+
             return
         self.remap_topics = {
             '/cam0/image_raw': self.create_publisher(Image, '/stereo/left/image_raw', 10),
@@ -136,7 +138,6 @@ class ImageRectifier(Node):
             10
         )
         
-
     def left_image_callback(self, msg):
         cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         rectified_image = cv.remap(cv_image, self.map1x, self.map1y, interpolation=cv.INTER_LINEAR)
@@ -151,6 +152,7 @@ class ImageRectifier(Node):
         rect_msg.header = msg.header
         self.pub_right_rect.publish(rect_msg)
 
+
 #  Esta clase es para el ejercio 2-c: Match de keypoints 
 class Matcher(Node):
     def __init__(self, triangulation):
@@ -161,7 +163,6 @@ class Matcher(Node):
         self.publisherFiltered = self.create_publisher(Image, '/stereo/filtered_matched_keypoints', 10)
         self.info = {}
         self.triangulation = triangulation
-        
         
     def set_info(self, info, side):
         stamp = info['header'].stamp
@@ -197,8 +198,7 @@ class Matcher(Node):
             filtered_msg.header = left['header']
             filtered_msg.header.frame_id = "filtered_matched_keypoints"
             self.publisherFiltered.publish(filtered_msg)
-            # cv.imshow("Matched Keypoints", matched_image)
-            # cv.waitKey(1)
+
             
 #  Esta clase es para el ejercio 2-b: Extraccion de keypoints
 class KeypointDetector(Node):
@@ -226,20 +226,18 @@ class KeypointDetector(Node):
             'descriptors': descriptors,
             'image': img,
             'header': msg.header
-            # 'stamp': msg.header.stamp
         }
         for dependency in self.dependencies:
             dependency.set_info(info, self.side)
         # Dibujar los puntos en la imagen
         output_image = cv.drawKeypoints(img, keypoints,None,color=(0,255,0))
-        # output_image = cv.drawKeypoints(img, keypoints, img, flags=cv.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+
         key_msg = self.bridge.cv2_to_imgmsg(output_image, encoding='bgr8')
         key_msg.header = msg.header
         self.publisher.publish(key_msg)
-            
-        # cv.waitKey(1)
 
 
+# Funcion para crear PointCloud2 a partir de puntos 3D
 def create_pointcloud2(points, header):
     field = [PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1)]
     buffer = b''.join([struct.pack('fff',*p) for p in points])
@@ -256,6 +254,7 @@ def create_pointcloud2(points, header):
     msg.is_bigendian = False
     msg.is_dense = False
     return msg
+
 
 #  Esta clase es para el ejercio 2-d: Triangulacion de puntos
 class TriangulatePoints(Node):
@@ -286,6 +285,7 @@ class TriangulatePoints(Node):
         
         # Publicar los puntos 3D como PointCloud2
 
+
 #  Esta clase es para el ejercio 2-e: Triangulacion de puntos con RANSAC
 class TriangulatedPointsRansac(TriangulatePoints):
     def __init__(self, node_name='triangulated_points_ransac', map=None):
@@ -310,8 +310,10 @@ class TriangulatedPointsRansac(TriangulatePoints):
         msg = self.bridge.cv2_to_imgmsg(img_vis, encoding='bgr8')
         msg.header = left_info['header']
         self.publisherImg.publish(msg)
-
+        if self.map is not None:
+            self.map.set_info(triangulatedPoints, left_info['header'])
         self.publish(triangulatedPoints, left_info['header'])
+
 
 #  Esta clase es para el ejercio 2-f: Mapeo de Features triangulados al sistema de coordenadas mundial
 class  MappingPoints(Node):
@@ -341,6 +343,8 @@ class  MappingPoints(Node):
         persistent_msg = create_pointcloud2(np.array(self.accumulated_points), header)
         self.publisher_persistent.publish(persistent_msg)
         self.frame += 1
+
+
 #  Esta clase es para el ejercio 2-g: Calculo del mapa de disparidad
 class DisparityMap(Node):
     def __init__(self):
@@ -361,16 +365,20 @@ class DisparityMap(Node):
             preFilterCap=63,
             mode=cv.STEREO_SGBM_MODE_SGBM_3WAY
         )
+
         self.subscription_left = self.create_subscription(
             Image,
             f'/stereo/left/image_rect',
             self.left_callback, 10)
+        
         self.subscription_right = self.create_subscription(
             Image,
             f'/stereo/right/image_rect',
             self.right_callback, 10)
+        
     def right_callback(self,msg):
         self.set_info(msg, "right")
+
     def left_callback(self,msg):
         self.set_info(msg, "left")
         
@@ -395,6 +403,7 @@ class DisparityMap(Node):
             disparity_map = self.stereo.compute(left_img, right_img)
             # disp_normalized = cv.normalize(disparity_map,None,255,0,cv.NORM_MINMAX, cv.CV_8U)
             self.publish(disparity_map, header)
+
 
 #  Esta clase es para el ejercio 2-h: Reconstruccion densa a partir del mapa de disparidad
 class Map3D(Node):
@@ -432,10 +441,11 @@ class Map3D(Node):
             msg = create_pointcloud2(points_3d[:] / 1000, header)
             self.publisher.publish(msg)
 
+
 #  Esta clase es para el ejercio 2-i: Reconstruccion densa con ground truth
 # Debido a que por cada frame se generan muchos puntos 3D, solo se publican 1 de cada 50 puntos
-class Map3dDense(Map3D):
-    def __init__(self, node_name='map_3d_dense'):
+class Map3dGroundTruth(Map3D):
+    def __init__(self, node_name='map_3d_w_ground_truth'):
         super().__init__(node_name)
         self.publisher_persistent = self.create_publisher(PointCloud2, f'/stereo/{node_name}_persistent', 10)
         self.frame = 0
@@ -467,6 +477,7 @@ class Map3dDense(Map3D):
                 self.publisher_persistent.publish(persistent_msg)      
         self.frame += 1 
 
+
 # Clase base para la estimacion de pose
 class EstimatePose(Node):
     def __init__(self, node_name='estimate_pose'):
@@ -483,7 +494,6 @@ class EstimatePose(Node):
         self.t = None
         self.baseline = abs(calib_data_right['projection_matrix']['data'][3]) / 1000  # Convertir a metros
         
-
     def set_info(self, info, side):
         pass
 
@@ -492,6 +502,7 @@ class EstimatePose(Node):
 
     def show(self, R, t):
         pass
+
 
 #  Esta clase es para el ejercio 2-j-1: Estimacion de pose entre dos camaras
 class ShowEstimatePoseLR(EstimatePose):
@@ -531,6 +542,7 @@ class ShowEstimatePoseLR(EstimatePose):
 
                 t = t * self.baseline                
                 self.t = t
+                
     def show(self, R = None, t = None):  
         # Plot origin and translation vector t in 3D
         try:
@@ -539,7 +551,8 @@ class ShowEstimatePoseLR(EstimatePose):
 
             fig = plt.figure(figsize=(6,6))
             ax = fig.add_subplot(111, projection='3d')
-        # Draw axis arrows from origin
+            
+            # Draw axis arrows from origin
             scale = np.linalg.norm(tvec)
             if scale == 0:
                 scale = 1.0
@@ -567,9 +580,11 @@ class ShowEstimatePoseLR(EstimatePose):
             ax.legend()
             plt.savefig('pose_estimation.png')
             plt.close()
+    
         except Exception as e:
           print("Could not plot 3D points:", e)
         self.calculated = True
+
 
 #  Esta clase es para el ejercio 2-j-2: Estimacion de camino realizado por la camara izquierda
 class EstimatePath(EstimatePose):
@@ -612,20 +627,17 @@ class EstimatePath(EstimatePose):
             inliers2 = new_point[mask]
 
             _, R, t, mask = cv.recoverPose(E, inliers2, inliers1, mask=mask, cameraMatrix=self.K1)
-            # print(f"Pre escalado: {t}")
+
             baseline = ground_truth_camera[i][1]
             t = t * baseline
             T = np.vstack((np.hstack((R, t)), [0, 0, 0, 1]))
 
             self.trajectory.append(ground_truth_camera[i-1][2] @ T)
-            # print(f"Post escalado: {t}, escala: {ground_truth[len(self.info)][1]}")
-            # xi_camera_i_to_next = np.vstack((np.hstack((R, t)), [0, 0, 0, 1]))
-            # last_pose = self.path[-1][1].reshape(4,4)
-            
-            # self.path.append((np.dot(last_pose, np.vstack((t,[1]))).ravel(), xi_camera_i_to_next))
+
         self.show()
+
     def show(self, R=None, t=None):
-        # print(self.path)
+
         fig = plt.figure(figsize=(10, 6))        
         ax = fig.add_subplot(111, projection='3d')
         aux_traj = self.trajectory
@@ -633,12 +645,6 @@ class EstimatePath(EstimatePose):
         x = poses[:, 0]
         y = poses[:, 1]
         z = poses[:, 2]
-        # x = [e[0][0] for e in self.path]
-        # y = [e[0][1] for e in self.path]
-        # z = [e[0][2] for e in self.path]
-        # gt = [e[2] for e in ground_truth] @ self.ImuToCam
-        # keep only the first half of ground truth poses (after transforming by ImuToCam)
-        # gt_mats = [e[2] for e in ground_truth]
         
         gt = ground_truth_camera[:len(self.trajectory)]
         gxs = [e[2][:3,3][0] for e in gt]
@@ -659,17 +665,20 @@ class EstimatePath(EstimatePose):
         plt.savefig('LeftCameraPath.svg')
         plt.close()
 
-def main(args=None):
+# Funcion principal
+def main(map3d_gt=False, ransac=False):
     print("Loading ground truth data")
     load_GT_data('ground_truth.csv')
-    rclpy.init(args=args)
+    rclpy.init(args=None)
     executor = MultiThreadedExecutor()
     print("Starting bag player")
     bag_player = BagPlayer()
     executor.add_node(bag_player)
     print("Starting 3D mapper")
-    # map3d = Map3D()
-    map3d = Map3dDense()
+    if map3d_gt :
+        map3d = Map3dGroundTruth()
+    else:    
+        map3d = Map3D()
     executor.add_node(map3d)
     print("Starting image rectifier")
     rectifier = ImageRectifier(map3d)
@@ -681,8 +690,10 @@ def main(args=None):
     mappingPoints = MappingPoints()
     executor.add_node(mappingPoints)
     print("starting Triangulation")    
-    triangulation = TriangulatePoints(map=mappingPoints)
-    # triangulation = TriangulatedPointsRansac()    
+    if ransac :
+        triangulation = TriangulatedPointsRansac(map=mappingPoints)    
+    else:
+        triangulation = TriangulatePoints(map=mappingPoints)
     executor.add_node(triangulation)
     print("Starting matcher")
     matcher = Matcher(triangulation)
@@ -716,4 +727,8 @@ def main(args=None):
         rclpy.shutdown()
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description="Procesamiento de datos de un dataset estereo")
+    parser.add_argument("--ransac", action="store_true", help="Utilizacion de RANSAC en la triangulacion")
+    parser.add_argument("--gt", action="store_true", help="Utilizacion de ground truth en el mapeo 3D de disparity map")
+    args = parser.parse_args()  
+    main(map3d_gt=args.gt, ransac=args.ransac)
