@@ -12,7 +12,8 @@ from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
 from rclpy.executors import MultiThreadedExecutor
 import struct
 import argparse
-
+import time
+from collections import namedtuple
 
 def load_yaml(file_path):
     with open(file_path, 'r') as file:
@@ -52,10 +53,36 @@ def load_GT_data(file_path='ground_truth.csv'):
         transform = ImuToCam @ transform  
         ground_truth_camera.append((newPoint, distance,transform))
 
+
+CalibrationData = namedtuple('CalibrationData', ['K1', 'D1', 'K2', 'D2', 'R', 'T', 'R1', 'R2', 'P1', 'P2', 'Q', 'image_size'])
+
+calibration_data = None
+def load_calibration_data():
+    global calibration_data
+    calib_data_left = load_yaml(f'calibrationdata/left.yaml')
+    calib_data_right = load_yaml(f'calibrationdata/right.yaml')
         
+    K1 = np.array(calib_data_left['camera_matrix']['data']).reshape(3, 3)
+    D1 = np.array(calib_data_left['distortion_coefficients']['data'])
+    K2 = np.array(calib_data_right['camera_matrix']['data']).reshape(3, 3)
+    D2 = np.array(calib_data_right['distortion_coefficients']['data'])
+    auxMatrix = np.array(calib_data_right['projection_matrix']['data']).reshape(3, 4)
+    R = auxMatrix[:, :3]
+    T = auxMatrix[:, 3]
+
+    image_size = (calib_data_left["image_width"], calib_data_left["image_height"])
+
+    # Compute rectification transforms
+    R1, R2, P1, P2, Q, _, _ = cv.stereoRectify(
+        K1, D1, K2, D2, 
+        image_size, R, T, flags=cv.CALIB_ZERO_DISPARITY, alpha=0    
+    )
+    calibration_data = CalibrationData(K1, D1, K2, D2, R, T, R1, R2, P1, P2, Q, image_size)
+
+
 #   Clase para reproducir el bag file y remapear los topics
 class BagPlayer(Node):
-    def __init__(self):
+    def __init__(self, executor_ref = None):
         super().__init__('bag_player')
         self.bridge = CvBridge()
         self.reader = SequentialReader()
@@ -70,10 +97,14 @@ class BagPlayer(Node):
             '/cam1/image_raw': self.create_publisher(Image, '/stereo/right/image_raw', 10),
         }
         self.timer = self.create_timer(0.1, self.timer_callback)
+        self.executor_ref = executor_ref
   
     def timer_callback(self):
         if not self.reader.has_next():
-            raise KeyboardInterrupt
+            print("End of bag file reached. Waiting to shutdown...")
+            time.sleep(10)  # Esperar un momento antes de cerrar
+            print("Shutting down executor.")            
+            self.executor_ref.shutdown()
             return
         while self.reader.has_next():
             (topic, raw_data, stamp) = self.reader.read_next()
@@ -86,38 +117,38 @@ class BagPlayer(Node):
 
 #  Esta clase es para el ejercio 2-a: Rectificacion de imagenes
 class ImageRectifier(Node):
-    def __init__(self, map3d):
+    def __init__(self):
         super().__init__('image_rectifier')
         self.bridge = CvBridge()
         # Load calibration data
-        calib_data_left = load_yaml(f'calibrationdata/left.yaml')
-        calib_data_right = load_yaml(f'calibrationdata/right.yaml')
+        # calib_data_left = load_yaml(f'calibrationdata/left.yaml')
+        # calib_data_right = load_yaml(f'calibrationdata/right.yaml')
         
-        self.K1 = np.array(calib_data_left['camera_matrix']['data']).reshape(3, 3)
-        self.D1 = np.array(calib_data_left['distortion_coefficients']['data'])
-        self.K2 = np.array(calib_data_right['camera_matrix']['data']).reshape(3, 3)
-        self.D2 = np.array(calib_data_right['distortion_coefficients']['data'])
-        auxMatrix = np.array(calib_data_right['projection_matrix']['data']).reshape(3, 4)
-        self.R = auxMatrix[:, :3]
-        self.T = auxMatrix[:, 3]
+        # self.K1 = np.array(calib_data_left['camera_matrix']['data']).reshape(3, 3)
+        # self.D1 = np.array(calib_data_left['distortion_coefficients']['data'])
+        # self.K2 = np.array(calib_data_right['camera_matrix']['data']).reshape(3, 3)
+        # self.D2 = np.array(calib_data_right['distortion_coefficients']['data'])
+        # auxMatrix = np.array(calib_data_right['projection_matrix']['data']).reshape(3, 4)
+        # self.R = auxMatrix[:, :3]
+        # self.T = auxMatrix[:, 3]
 
-        self.image_size = (calib_data_left["image_width"], calib_data_left["image_height"])
+        # self.image_size = (calib_data_left["image_width"], calib_data_left["image_height"])
 
-        # Compute rectification transforms
-        self.R1, self.R2, self.P1, self.P2, self.Q, _, _ = cv.stereoRectify(
-            self.K1, self.D1, self.K2, self.D2, 
-            self.image_size, self.R, self.T, flags=cv.CALIB_ZERO_DISPARITY, alpha=0
-        )
-        if map3d is not None:
-            map3d.setQ(self.Q)
+        # # Compute rectification transforms
+        # self.R1, self.R2, self.P1, self.P2, self.Q, _, _ = cv.stereoRectify(
+        #     self.K1, self.D1, self.K2, self.D2, 
+        #     self.image_size, self.R, self.T, flags=cv.CALIB_ZERO_DISPARITY, alpha=0
+        # )
+        
         # Precompute the undistortion and rectification maps
+        print(calibration_data)
         self.map1x, self.map1y = cv.initUndistortRectifyMap(
-            self.K1, self.D1, self.R1, self.P1, 
-            self.image_size, cv.CV_32FC1
+            calibration_data.K1, calibration_data.D1, calibration_data.R1, calibration_data.P1, 
+            calibration_data.image_size, cv.CV_32FC1
         )
         self.map2x, self.map2y = cv.initUndistortRectifyMap(
-            self.K2, self.D2, self.R2, self.P2, 
-            self.image_size, cv.CV_32FC1
+            calibration_data.K2, calibration_data.D2, calibration_data.R2, calibration_data.P2, 
+            calibration_data.image_size, cv.CV_32FC1
         )
         
         # Publishers
@@ -415,7 +446,6 @@ class Map3D(Node):
         self.RMatrix = np.array([[0, 0, -1],
                                  [0, -1, 0],
                                  [1, 0, 0]])
-        self.Q = None 
         self.subscription = self.create_subscription(
             Image,
             f'/stereo/disparity',
@@ -424,22 +454,20 @@ class Map3D(Node):
         disparity = self.bridge.imgmsg_to_cv2(msg)
         self.compute(disparity, msg.header)
 
-    def setQ(self, Q):
-        self.Q = Q
+    
         
-    def compute(self, disparity, header):
-        if self.Q is not None:
-            # Reescalar la disparidad
-            disparity = disparity.astype(np.float32) / 16.0
-            # Reproyectar a 3D
-            points_3d = cv.reprojectImageTo3D(disparity, self.Q)
-            mask = disparity > disparity.min()
-            points_3d = points_3d[mask]
-            points_3d = points_3d[ ~np.isnan(points_3d[:,2]) & ~np.isinf(points_3d[:,2]) & (points_3d[:,2] != 0)]            
-            points_3d = points_3d.reshape(-1, 3)
+    def compute(self, disparity, header):        
+        # Reescalar la disparidad
+        disparity = disparity.astype(np.float32) / 16.0
+        # Reproyectar a 3D
+        points_3d = cv.reprojectImageTo3D(disparity, calibration_data.Q)
+        mask = disparity > disparity.min()
+        points_3d = points_3d[mask]
+        points_3d = points_3d[ ~np.isnan(points_3d[:,2]) & ~np.isinf(points_3d[:,2]) & (points_3d[:,2] != 0)]            
+        points_3d = points_3d.reshape(-1, 3)
 
-            msg = create_pointcloud2(points_3d[:] / 1000, header)
-            self.publisher.publish(msg)
+        msg = create_pointcloud2(points_3d[:] / 1000, header)
+        self.publisher.publish(msg)
 
 
 #  Esta clase es para el ejercio 2-i: Reconstruccion densa con ground truth
@@ -452,29 +480,28 @@ class Map3dGroundTruth(Map3D):
         self.accumulated_points = []
 
     def compute(self, disparity, header):
-        if self.Q is not None:
-            if self.frame % 5 == 0:
-            # Reescalar la disparidad
-                disparity = disparity.astype(np.float32) / 16.0
-                # Reproyectar a 3D
-                points_3d = cv.reprojectImageTo3D(disparity, self.Q)
-                mask = disparity > disparity.min()
-                points_3d = points_3d[mask]
-                points_3d = points_3d[ ~np.isnan(points_3d[:,2]) & ~np.isinf(points_3d[:,2]) & (points_3d[:,2] != 0)]
-                points_3d = points_3d.reshape(-1, 3)
-                gt_transform = ground_truth_camera[self.frame][2]
-                R = gt_transform[:3, :3]
-                t = gt_transform[:3, 3].reshape(1, 3)
-                world_points = []
-                for index in range(0,len(points_3d),50):                
-                    point = points_3d[index]
-                    newPoint = (R @ point.T) + t.ravel()
-                    world_points.append(newPoint / 1000)
-                msg = create_pointcloud2(np.array(world_points), header)
-                self.publisher.publish(msg)
-                self.accumulated_points.extend(world_points)
-                persistent_msg = create_pointcloud2(np.array(self.accumulated_points), header)
-                self.publisher_persistent.publish(persistent_msg)      
+        if self.frame % 5 == 0:
+        # Reescalar la disparidad
+            disparity = disparity.astype(np.float32) / 16.0
+            # Reproyectar a 3D
+            points_3d = cv.reprojectImageTo3D(disparity, calibration_data.Q)
+            mask = disparity > disparity.min()
+            points_3d = points_3d[mask]
+            points_3d = points_3d[ ~np.isnan(points_3d[:,2]) & ~np.isinf(points_3d[:,2]) & (points_3d[:,2] != 0)]
+            points_3d = points_3d.reshape(-1, 3)
+            gt_transform = ground_truth_camera[self.frame][2]
+            R = gt_transform[:3, :3]
+            t = gt_transform[:3, 3].reshape(1, 3)
+            world_points = []
+            for index in range(0,len(points_3d),50):                
+                point = points_3d[index]
+                newPoint = (R @ point.T) + t.ravel()
+                world_points.append(newPoint / 1000)
+            msg = create_pointcloud2(np.array(world_points), header)
+            self.publisher.publish(msg)
+            self.accumulated_points.extend(world_points)
+            persistent_msg = create_pointcloud2(np.array(self.accumulated_points), header)
+            self.publisher_persistent.publish(persistent_msg)      
         self.frame += 1 
 
 
@@ -485,14 +512,12 @@ class EstimatePose(Node):
         self.bridge = CvBridge()
         self.bf = cv.BFMatcher(cv.NORM_HAMMING, crossCheck=True)
         self.calculated = False
-        self.info = {}
-        calib_data_left = load_yaml(f'calibrationdata/left.yaml')
-        calib_data_right = load_yaml(f'calibrationdata/right.yaml')
+        self.info = {}        
         
-        self.K1 = np.array(calib_data_left['camera_matrix']['data']).reshape(3, 3)
-        self.K2 = np.array(calib_data_right['camera_matrix']['data']).reshape(3, 3)
+        self.K1 = calibration_data.K1
+        self.K2 = calibration_data.K2
         self.t = None
-        self.baseline = abs(calib_data_right['projection_matrix']['data'][3]) / 1000  # Convertir a metros
+        self.baseline = abs(calibration_data.T[0]) / 1000  # Convertir a metros
         
     def set_info(self, info, side):
         pass
@@ -669,10 +694,11 @@ class EstimatePath(EstimatePose):
 def main(map3d_gt=False, ransac=False):
     print("Loading ground truth data")
     load_GT_data('ground_truth.csv')
+    load_calibration_data()
     rclpy.init(args=None)
     executor = MultiThreadedExecutor()
     print("Starting bag player")
-    bag_player = BagPlayer()
+    bag_player = BagPlayer(executor_ref=executor)
     executor.add_node(bag_player)
     print("Starting 3D mapper")
     if map3d_gt :
@@ -681,7 +707,7 @@ def main(map3d_gt=False, ransac=False):
         map3d = Map3D()
     executor.add_node(map3d)
     print("Starting image rectifier")
-    rectifier = ImageRectifier(map3d)
+    rectifier = ImageRectifier()
     executor.add_node(rectifier)
     print("Starting image disparity")
     dispMap = DisparityMap()
@@ -709,9 +735,8 @@ def main(map3d_gt=False, ransac=False):
     try:
         executor.spin()
     except KeyboardInterrupt:
-        pass
+        executor.shutdown()        
     finally:
-        executor.shutdown()
         estimator.show()
         pathEstimator.compute()        
         bag_player.destroy_node()
