@@ -119,29 +119,8 @@ class BagPlayer(Node):
 class ImageRectifier(Node):
     def __init__(self):
         super().__init__('image_rectifier')
-        self.bridge = CvBridge()
-        # Load calibration data
-        # calib_data_left = load_yaml(f'calibrationdata/left.yaml')
-        # calib_data_right = load_yaml(f'calibrationdata/right.yaml')
-        
-        # self.K1 = np.array(calib_data_left['camera_matrix']['data']).reshape(3, 3)
-        # self.D1 = np.array(calib_data_left['distortion_coefficients']['data'])
-        # self.K2 = np.array(calib_data_right['camera_matrix']['data']).reshape(3, 3)
-        # self.D2 = np.array(calib_data_right['distortion_coefficients']['data'])
-        # auxMatrix = np.array(calib_data_right['projection_matrix']['data']).reshape(3, 4)
-        # self.R = auxMatrix[:, :3]
-        # self.T = auxMatrix[:, 3]
-
-        # self.image_size = (calib_data_left["image_width"], calib_data_left["image_height"])
-
-        # # Compute rectification transforms
-        # self.R1, self.R2, self.P1, self.P2, self.Q, _, _ = cv.stereoRectify(
-        #     self.K1, self.D1, self.K2, self.D2, 
-        #     self.image_size, self.R, self.T, flags=cv.CALIB_ZERO_DISPARITY, alpha=0
-        # )
-        
+        self.bridge = CvBridge()        
         # Precompute the undistortion and rectification maps
-        print(calibration_data)
         self.map1x, self.map1y = cv.initUndistortRectifyMap(
             calibration_data.K1, calibration_data.D1, calibration_data.R1, calibration_data.P1, 
             calibration_data.image_size, cv.CV_32FC1
