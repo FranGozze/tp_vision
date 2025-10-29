@@ -411,7 +411,6 @@ class DisparityMap(Node):
             left_img = self.info[stamp]["left"]
             right_img = self.info[stamp]["right"]
             disparity_map = self.stereo.compute(left_img, right_img)
-            # disp_normalized = cv.normalize(disparity_map,None,255,0,cv.NORM_MINMAX, cv.CV_8U)
             self.publish(disparity_map, header)
 
 
@@ -449,7 +448,7 @@ class Map3D(Node):
         self.publisher.publish(msg)
 
 
-#  Esta clase es para el ejercio 2-i: Reconstruccion densa con ground truth
+# Esta clase es para el ejercio 2-i: Reconstruccion densa con ground truth
 # Debido a que por cada frame se generan muchos puntos 3D, solo se publican 1 de cada 50 puntos
 class Map3dGroundTruth(Map3D):
     def __init__(self, node_name='map_3d_w_ground_truth'):
@@ -599,7 +598,6 @@ class EstimatePath(EstimatePose):
         
         # path is the list of positions
         self.path = []
-        # self.trajectory = [np.eye(4)]
         
         self.trajectory = [ground_truth_camera[0][2]] # this should be np.eye(4)
         
