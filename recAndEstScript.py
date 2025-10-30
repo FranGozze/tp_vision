@@ -538,18 +538,15 @@ class Map3dGroundTruth(Map3D):
             step = 5
             for index in range(0,len(points_3d), step):                
                 point = points_3d[index]
-                # newPoint = (R @ point.T).T + t             
                 newPoint = (R @ point.T) 
                 newPoint += t.ravel()
                 world_points.append(newPoint)                
             msg = create_pointcloud2_color(np.array(world_points), np.array(colors[::step]), header)
-            # msg = create_pointcloud2(np.array(world_points), header)
             self.publisher.publish(msg)
             self.accumulated_points.extend(world_points)
             self.accumulated_colors.extend(colors[::step])
             
-            persistent_msg = create_pointcloud2_color(np.array(self.accumulated_points), np.array(self.accumulated_colors), header)
-            # persistent_msg = create_pointcloud2(np.array(self.accumulated_points), header)
+            persistent_msg = create_pointcloud2_color(np.array(self.accumulated_points), np.array(self.accumulated_colors), header)            
             self.publisher_persistent.publish(persistent_msg)      
         self.frame += 1 
 
