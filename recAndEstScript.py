@@ -41,9 +41,9 @@ def transformPath(x,y,z,qw,qx,qy,qz):
     return transform
 
 
-def load_GT_data(file_path='ground_truth.csv'):
+def load_GT_data(file_path='ground_truth.csv', calibr_file='kalibr_imucam_chain.yaml'):
     df = pd.read_csv(file_path, header=0)
-    xi = load_yaml(f'kalibr_imucam_chain.yaml')
+    xi = load_yaml(calibr_file)
     ImuToCam =  np.array(xi['cam0']['T_imu_cam']).reshape(4,4)
     for index, row in df.iterrows():
         newPoint = np.array([row['px'], row['py'], row['pz']])
@@ -736,9 +736,9 @@ class EstimatePath(EstimatePose):
         plt.close()
 
 # Funcion principal
-def main(map3d_gt=False, ransac=False, calibration_dir="calibrationdata", bag_dir="V1_01_easy"):
+def main(map3d_gt=False, ransac=False, calibration_dir="calibrationdata", bag_dir="V1_01_easy", ground_truth_file="ground_truth.csv", calibr_file="kalibr_imucam_chain.yaml"):
     print("Loading ground truth data")
-    load_GT_data('ground_truth.csv')
+    load_GT_data(ground_truth_file, calibr_file)
     load_calibration_data(calibration_dir)
     rclpy.init(args=None)
     executor = MultiThreadedExecutor()
@@ -802,5 +802,7 @@ if __name__ == '__main__':
     parser.add_argument("--gt", action="store_true", help="Utilizacion de ground truth en el mapeo 3D de disparity map")
     parser.add_argument("--calibration-dir", default="calibrationdata", help="Directorio con los archivos de calibracion")
     parser.add_argument("--bag-dir", default="V1_01_easy", help="Directorio con la bag a reproducir")
+    parser.add_argument("--ground-truth", default="ground_truth.csv", help="Ground-truth correspondiente a la bag proveida")
+    parser.add_argument("--calibr-file", default="kalibr_imucam_chain.yaml", help="Archivo de calibracion correspondientes a la camara y el IMU proveidos")
     args = parser.parse_args()      
-    main(map3d_gt=args.gt, ransac=args.ransac, calibration_dir=args.calibration_dir, bag_dir=args.bag_dir)
+    main(map3d_gt=args.gt, ransac=args.ransac, calibration_dir=args.calibration_dir, bag_dir=args.bag_dir, ground_truth_file=args.ground_truth, calibr_file=args.calibr_file)

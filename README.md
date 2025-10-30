@@ -29,3 +29,5 @@ Donde ademas tendremos las siguientes opciones a la hora de correrlo
     `--gt`: Se utilizaran las poses dadas por el ground-truth en el mapa denso generado por el disparity map
     `--calibration-dir <DIR>`: Los archivos de calibracion se encuentran en el directorio `<DIR>`
     `--bag-dir <DIR>`: La bag que se debe reproducir se encuentra en el directorio `<DIR>`
+    `--ground-truth <FILE>` El archivo ground-truth correspondiente a la bag que se proveyo en el directorio
+    `--calibr-file <FILE>` El achivo de calibracion que contiene las matrices necesarias para cambiar de IMU a la camara izquierda
