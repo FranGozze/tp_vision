@@ -27,3 +27,5 @@ python3 recAndEstScript.py
 Donde ademas tendremos las siguientes opciones a la hora de correrlo
     `--ransac`: Se utilira el metodo RANSAC para filtrar matches espureos
     `--gt`: Se utilizaran las poses dadas por el ground-truth en el mapa denso generado por el disparity map
+    `--calibration-dir <DIR>`: Los archivos de calibracion se encuentran en el directorio `<DIR>`
+    `--bag-dir <DIR>`: La bag que se debe reproducir se encuentra en el directorio `<DIR>`

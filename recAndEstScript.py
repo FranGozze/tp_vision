@@ -2,6 +2,7 @@ import cv2 as cv
 import numpy as np
 from matplotlib import pyplot as plt
 import yaml
+import math
 import pandas as pd
 import rclpy
 import transforms3d
@@ -14,6 +15,8 @@ import struct
 import argparse
 import time
 from collections import namedtuple
+from sensor_msgs_py import point_cloud2 as pc2
+
 
 def load_yaml(file_path):
     with open(file_path, 'r') as file:
@@ -57,10 +60,10 @@ def load_GT_data(file_path='ground_truth.csv'):
 CalibrationData = namedtuple('CalibrationData', ['K1', 'D1', 'K2', 'D2', 'R', 'T', 'R1', 'R2', 'P1', 'P2', 'Q', 'image_size'])
 
 calibration_data = None
-def load_calibration_data():
+def load_calibration_data(dir_path='calibrationdata'):
     global calibration_data
-    calib_data_left = load_yaml(f'calibrationdata/left.yaml')
-    calib_data_right = load_yaml(f'calibrationdata/right.yaml')
+    calib_data_left = load_yaml(f'{dir_path}/left.yaml')
+    calib_data_right = load_yaml(f'{dir_path}/right.yaml')
         
     K1 = np.array(calib_data_left['camera_matrix']['data']).reshape(3, 3)
     D1 = np.array(calib_data_left['distortion_coefficients']['data'])
@@ -82,12 +85,12 @@ def load_calibration_data():
 
 #   Clase para reproducir el bag file y remapear los topics
 class BagPlayer(Node):
-    def __init__(self, executor_ref = None):
+    def __init__(self, bag_dir="V1_01_easy" , executor_ref = None):
         super().__init__('bag_player')
         self.bridge = CvBridge()
         self.reader = SequentialReader()
         try:
-            self.reader.open(StorageOptions(uri='V1_01_easy'), ConverterOptions( input_serialization_format='cdr', output_serialization_format='cdr'))
+            self.reader.open(StorageOptions(uri=bag_dir), ConverterOptions( input_serialization_format='cdr', output_serialization_format='cdr'))
         except Exception as e:
             self.get_logger().error(f'Failed to open bag file: {e}')
 
@@ -247,11 +250,11 @@ class KeypointDetector(Node):
         self.publisher.publish(key_msg)
 
 
-# Funcion para crear PointCloud2 a partir de puntos 3D
 def create_pointcloud2(points, header):
-    field = [PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1)]
+    field = [PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+             PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+             PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1)]
     buffer = b''.join([struct.pack('fff',*p) for p in points])
-
     msg = PointCloud2()
     msg.width = points.shape[0]
     msg.height = 1
@@ -263,6 +266,39 @@ def create_pointcloud2(points, header):
     msg.fields = field
     msg.is_bigendian = False
     msg.is_dense = False
+    return msg
+
+# Funcion para crear PointCloud2 a partir de puntos 3D poniendoles color
+def create_pointcloud2_color(points, colors, header):
+    fields = [
+        PointField(name='x', offset=0,  datatype= PointField.FLOAT32, count=1),
+        PointField(name='y', offset=4,  datatype=PointField.FLOAT32, count=1),
+        PointField(name='z', offset=8,  datatype=PointField.FLOAT32, count=1),
+        PointField(name='rgb', offset=12, datatype=PointField.FLOAT32, count=1)
+    ]
+    cloud = np.zeros(points.shape[0],
+        dtype=[
+            ('x', np.float32),
+            ('y', np.float32),
+            ('z', np.float32),
+            ('rgb', np.float32)
+        ]
+    )
+    rgb_uint32 = (colors.astype(np.uint32) << 16) | \
+             (colors.astype(np.uint32) << 8)  | \
+              colors.astype(np.uint32)
+    rgb_float32 = rgb_uint32.view(np.float32)
+
+    # Cargar los datos
+    cloud['x'] = points[:, 0]
+    cloud['y'] = points[:, 1]
+    cloud['z'] = points[:, 2]
+    
+    cloud['rgb'] = rgb_float32
+    
+    header.frame_id = "map"
+    msg = pc2.create_cloud(header, fields, cloud)
+    
     return msg
 
 
@@ -366,14 +402,14 @@ class DisparityMap(Node):
             minDisparity=0,
             numDisparities=16 * 5,
             blockSize=11,
-            P1=8 * 1 * 11**2,   # 1 instead of 3 for grayscale
-            P2=32 * 1 * 11**2,  # 1 instead of 3 for grayscale
+            P1=8 * 11**2,   # 1 instead of 3 for grayscale
+            P2=32 * 11**2,  # 1 instead of 3 for grayscale
             disp12MaxDiff=1,
             uniquenessRatio=10,
             speckleWindowSize=100,
             speckleRange=32,
             preFilterCap=63,
-            mode=cv.STEREO_SGBM_MODE_SGBM_3WAY
+            # mode=cv.STEREO_SGBM_MODE_SGBM_3WAY
         )
 
         self.subscription_left = self.create_subscription(
@@ -427,25 +463,50 @@ class Map3D(Node):
         self.subscription = self.create_subscription(
             Image,
             f'/stereo/disparity',
-            self.callback, 10)
+            self.callback, 10)    
+        
+        self.subscription_rect = self.create_subscription(
+            Image,
+            f'/stereo/left/image_rect',
+            self.callback_rect, 10)
+        self.img_rect = {} 
+
     def callback(self,msg):
         disparity = self.bridge.imgmsg_to_cv2(msg)
         self.compute(disparity, msg.header)
 
-    
-        
-    def compute(self, disparity, header):        
-        # Reescalar la disparidad
-        disparity = disparity.astype(np.float32) / 16.0
-        # Reproyectar a 3D
-        points_3d = cv.reprojectImageTo3D(disparity, calibration_data.Q)
-        mask = disparity > disparity.min()
-        points_3d = points_3d[mask]
-        points_3d = points_3d[ ~np.isnan(points_3d[:,2]) & ~np.isinf(points_3d[:,2]) & (points_3d[:,2] != 0)]            
-        points_3d = points_3d.reshape(-1, 3)
-
-        msg = create_pointcloud2(points_3d[:] / 1000, header)
+    def callback_rect(self,msg):
+        img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        stamp = msg.header.stamp
+        stamp_obj = (stamp.sec, stamp.nanosec)
+        self.img_rect[stamp_obj] = img
+    def publish(self, points_3d, colors, header):
+        msg = create_pointcloud2_color(points_3d, colors, header)
         self.publisher.publish(msg)
+    def compute(self, disparity, header):        
+        stamp = header.stamp
+        if (stamp.sec, stamp.nanosec) in self.img_rect:
+            img = self.img_rect[(stamp.sec, stamp.nanosec)]
+            img = cv.cvtColor(img, cv.COLOR_BGR2GRAY)  
+            disparity = disparity.astype(np.float32) / 16.0 
+            points_3d = cv.reprojectImageTo3D(disparity, calibration_data.Q)
+            
+            
+            
+            # for i in range(len(points_3d)):
+            #     for j in range(len(mask[i])):
+            #         if mask[i][j] and (not np.isnan(points_3d[i][j][2]))  and (not np.isinf(points_3d[i][j][2])) and (points_3d[i][j][2] != 0):
+            #             new_points_3d.append(points_3d[i][j])
+            #             colors.append(img[i][j])
+                        
+            
+            mask = (disparity > disparity.min()) & (~np.isnan(points_3d[:,:,2])) & ~np.isinf(points_3d[:,:,2]) & (points_3d[:,:,2] != 0)
+            points_3d = points_3d[mask]
+            # points_3d = points_3d.reshape(-1, 3)
+            colors = img[mask]                     
+            # msg = create_pointcloud2(points_3d[:] / 1000, header)
+            self.publish(points_3d, colors, header)
+            
 
 
 # Esta clase es para el ejercio 2-i: Reconstruccion densa con ground truth
@@ -456,29 +517,39 @@ class Map3dGroundTruth(Map3D):
         self.publisher_persistent = self.create_publisher(PointCloud2, f'/stereo/{node_name}_persistent', 10)
         self.frame = 0
         self.accumulated_points = []
+        self.accumulated_colors = []
 
     def compute(self, disparity, header):
-        if self.frame % 5 == 0:
-        # Reescalar la disparidad
+        stamp = header.stamp        
+        if self.frame % 5 == 0 and (stamp.sec, stamp.nanosec) in self.img_rect:
+            img = self.img_rect[(stamp.sec, stamp.nanosec)]
+            img = cv.cvtColor(img, cv.COLOR_BGR2GRAY)              
             disparity = disparity.astype(np.float32) / 16.0
             # Reproyectar a 3D
             points_3d = cv.reprojectImageTo3D(disparity, calibration_data.Q)
-            mask = disparity > disparity.min()
-            points_3d = points_3d[mask]
-            points_3d = points_3d[ ~np.isnan(points_3d[:,2]) & ~np.isinf(points_3d[:,2]) & (points_3d[:,2] != 0)]
+            mask = (disparity > disparity.min()) & (~np.isnan(points_3d[:,:,2])) & ~np.isinf(points_3d[:,:,2]) & (points_3d[:,:,2] != 0)
+            points_3d = points_3d[mask]                        
             points_3d = points_3d.reshape(-1, 3)
+            colors = img[mask]                             
             gt_transform = ground_truth_camera[self.frame][2]
             R = gt_transform[:3, :3]
             t = gt_transform[:3, 3].reshape(1, 3)
-            world_points = []
-            for index in range(0,len(points_3d),50):                
+            world_points = []            
+            step = 5
+            for index in range(0,len(points_3d), step):                
                 point = points_3d[index]
-                newPoint = (R @ point.T) + t.ravel()
-                world_points.append(newPoint / 1000)
-            msg = create_pointcloud2(np.array(world_points), header)
+                # newPoint = (R @ point.T).T + t             
+                newPoint = (R @ point.T) 
+                newPoint += t.ravel()
+                world_points.append(newPoint)                
+            msg = create_pointcloud2_color(np.array(world_points), np.array(colors[::step]), header)
+            # msg = create_pointcloud2(np.array(world_points), header)
             self.publisher.publish(msg)
             self.accumulated_points.extend(world_points)
-            persistent_msg = create_pointcloud2(np.array(self.accumulated_points), header)
+            self.accumulated_colors.extend(colors[::step])
+            
+            persistent_msg = create_pointcloud2_color(np.array(self.accumulated_points), np.array(self.accumulated_colors), header)
+            # persistent_msg = create_pointcloud2(np.array(self.accumulated_points), header)
             self.publisher_persistent.publish(persistent_msg)      
         self.frame += 1 
 
@@ -668,14 +739,14 @@ class EstimatePath(EstimatePose):
         plt.close()
 
 # Funcion principal
-def main(map3d_gt=False, ransac=False):
+def main(map3d_gt=False, ransac=False, calibration_dir="calibrationdata", bag_dir="V1_01_easy"):
     print("Loading ground truth data")
     load_GT_data('ground_truth.csv')
-    load_calibration_data()
+    load_calibration_data(calibration_dir)
     rclpy.init(args=None)
     executor = MultiThreadedExecutor()
     print("Starting bag player")
-    bag_player = BagPlayer(executor_ref=executor)
+    bag_player = BagPlayer(bag_dir=bag_dir,executor_ref=executor)
     executor.add_node(bag_player)
     print("Starting 3D mapper")
     if map3d_gt :
@@ -732,5 +803,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Procesamiento de datos de un dataset estereo")
     parser.add_argument("--ransac", action="store_true", help="Utilizacion de RANSAC en la triangulacion")
     parser.add_argument("--gt", action="store_true", help="Utilizacion de ground truth en el mapeo 3D de disparity map")
-    args = parser.parse_args()  
-    main(map3d_gt=args.gt, ransac=args.ransac)
+    parser.add_argument("--calibration-dir", default="calibrationdata", help="Directorio con los archivos de calibracion")
+    parser.add_argument("--bag-dir", default="V1_01_easy", help="Directorio con la bag a reproducir")
+    args = parser.parse_args()      
+    main(map3d_gt=args.gt, ransac=args.ransac, calibration_dir=args.calibration_dir, bag_dir=args.bag_dir)
